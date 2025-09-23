@@ -730,6 +730,14 @@ class AnchorBaseBeam:
         objective_fn = OBJECTIVES[objective] if isinstance(objective, str) else objective
         constraint_fn = CONSTRAINTS[constraint] if isinstance(constraint, str) else constraint
 
+
+        is_precision_constraint = (
+            (isinstance(constraint, str) and constraint == "lcb_precision")
+            or (constraint_fn is cons_lcb_precision)
+        )
+        constraint_label = constraint if isinstance(constraint, str) else constraint_fn.__name__
+        objective_label = objective if isinstance(objective, str) else objective.__name__
+
         # Select coverage set and initialise object state
         coverage_data = self._get_coverage_samples(
             coverage_samples,
@@ -738,35 +746,55 @@ class AnchorBaseBeam:
         self._init_state(batch_size, coverage_data)
 
         # sample by default 1 or min_samples_start more random value(s)
+        # sample by default 1 or min_samples_start more random value(s)
         (pos,), (total,) = self.draw_samples([()], min_samples_start)
 
-        # mean = fraction of labels sampled data that equals the label of the instance to be explained, ...
-        # ... equivalent to prec(A) in paper (eq.2)
-        mean = np.array([pos / total])
+        mean = np.array([pos / total])              # P(B) and P(B|A=∅)
         beta = np.log(1. / delta)
-        # lower bound on mean precision
         lb = self.dlow_bernoulli(mean, np.array([beta / total]))
+        ub = lb  # not used here, but keep shape if you like
 
-        # if lower precision bound below tau with margin eps, keep sampling data until lb is high enough ...
-        # or mean falls below precision threshold
-        while mean > desired_confidence and lb < desired_confidence - epsilon:
-            (n_pos,), (n_total,) = self.draw_samples([()], batch_size)
-            pos += n_pos
-            total += n_total
-            mean = np.array([pos / total])
-            lb = self.dlow_bernoulli(mean, np.array([beta / total]))
+        # Evaluate constraint on the empty anchor
+        if is_precision_constraint:
+            ok_empty = cons_lcb_precision(
+                RuleBatchStats(
+                    p_a=np.array([1.0]),          # A=∅ holds everywhere
+                    p_b_given_a=mean,             # precision on empty rule
+                    p_b=float(mean),              # base rate
+                    lb_prec=lb, ub_prec=lb, n=np.array([total]),
+                ),
+                desired_confidence,
+                epsilon_stop,
+            )
+        else:
+            ok_empty = constraint_fn(
+                RuleBatchStats(
+                    p_a=np.array([1.0]),
+                    p_b_given_a=mean,
+                    p_b=float(mean),
+                    lb_prec=lb, ub_prec=lb, n=np.array([total]),
+                ),
+                **(constraint_kwargs or {}),
+            )
 
-        # if prec_lb(A) > tau for A=() then the empty result satisfies the constraints ...
-        if lb > desired_confidence:
+        if np.asarray(ok_empty).item():
             return {
                 'feature': [],
                 'mean': [],
                 'num_preds': total,
                 'precision': [],
-                'coverage': [],
+                'coverage': [1.0],
                 'examples': [],
                 'all_precision': mean,
                 'success': True,
+                'objective_name': objective_label,
+                'constraint_name': constraint_label,
+                'score': [float(objective_fn(RuleBatchStats(
+                    p_a=np.array([1.0]),
+                    p_b_given_a=mean,
+                    p_b=float(mean),
+                    lb_prec=lb, ub_prec=lb, n=np.array([total]),
+                ))[0])],
             }
 
         current_size = 1
@@ -847,7 +875,7 @@ class AnchorBaseBeam:
             base_p = self.state.get('all_precision', None)
             if base_p is None:
                 # fallback: estimate once by drawing with empty anchor
-                pos_b, tot_b = self.draw_samples([()], max(100, batch_size))
+                (pos_b,), (tot_b,)= self.draw_samples([()], max(100, batch_size))
                 base_p = float(pos_b) / float(tot_b)
 
             rb = RuleBatchStats(
@@ -869,7 +897,7 @@ class AnchorBaseBeam:
                 for i in range(len(best_of_size[current_size])):
                     t = best_of_size[current_size][i]
                     print(f'{t} mean={means[i]:.3f} lb={lbs[i]:.3f} ub={ubs[i]:.3f} P(A)={coverages[i]:.3f} '
-                        f'score={scores[i]:.4f} valid={bool(valid_mask[i])}')
+                        f'score={scores[i]:.4f} valid={bool(valid_mask[i])} by constraint="{constraint_label}" score={scores[i]:.4f}')
 
             # --- collect top-K valid anchors by objective ---
             for idx in range(len(best_of_size[current_size])):
@@ -911,29 +939,62 @@ class AnchorBaseBeam:
 
             current_size += 1
 
-        # if no result is found, choose highest precision of best result candidate from every round
+        # if no result is found, choose the highest-OBJECTIVE candidate from all rounds (ignoring the constraint)
+
         if not best_anchor:
             success = False  # indicates the method has not found an anchor
-            logger.warning(f'Could not find an anchor satisfying the {desired_confidence} precision constraint. '
-                           f'Now returning the best non-eligible result. The desired precision threshold might not be '
-                           f'achieved due to the quantile-based discretisation of the numerical features. The '
-                           f'resolution of the bins may be too large to find an anchor of required precision. '
-                           f'Consider increasing the number of bins in `disc_perc`, but note that for some '
-                           f'numerical distribution (e.g. skewed distribution) it may not help.')
+            logger.warning(
+                f'No anchor satisfied the "{constraint_label}" constraint. '
+                f'Returning the best candidate by objective "{objective_label}" without enforcing the constraint.'
+                + (f' (requested precision threshold={desired_confidence})' if is_precision_constraint else '')
+            )
             anchors = []
             for i in range(0, current_size):
                 anchors.extend(best_of_size[i])
-            stats = self.get_init_stats(anchors)
-            candidate_anchors = self.kllucb(
-                anchors,
-                stats,
-                epsilon,
-                delta,
-                batch_size,
-                1,  # beam size
-                verbose=verbose,
+            if len(anchors) == 0:
+                return {
+                    'feature': [],
+                    'mean': [],
+                    'num_preds': int(total),
+                    'precision': [],
+                    'coverage': [],
+                    'examples': [],
+                    'all_precision': mean,
+                    'success': False,
+                    'objective_name': objective_label,
+                    'constraint_name': constraint_label,
+                }
+
+            # score all anchors by the chosen objective (ignore constraint)
+            stats = self.get_init_stats(anchors, coverages=True)
+            positives, n_samples = stats['positives'], stats['n_samples']
+            means = positives / n_samples
+            coverages = stats['coverages']
+
+            # bounds (not strictly needed for objective, but may be useful downstream)
+            beta_all = np.log(1. / (delta / (1 + (beam_size - 1) * self.state['n_features'])))
+            kl_all = beta_all / n_samples
+            lbs_all = self.dlow_bernoulli(means, kl_all)
+            ubs_all = self.dup_bernoulli(means, kl_all)
+
+            # base rate P(B)
+            (pos_b,), (tot_b,) = self.draw_samples([()], max(100, batch_size))
+            base_p = float(pos_b) / float(tot_b)
+
+            rb_all = RuleBatchStats(
+                p_a=coverages, p_b_given_a=means, p_b=base_p,
+                lb_prec=lbs_all, ub_prec=ubs_all, n=n_samples
             )
-            best_anchor = anchors[candidate_anchors[0]]
+            scores_all = objective_fn(rb_all)
+            j = int(np.argmax(scores_all))
+
+            best_anchor = anchors[j]
+            best_score = float(scores_all[j])
+            best_payload = dict(
+                score=best_score, score_name=objective_label, constraint_name=constraint_label,
+                p_a=float(coverages[j]), p_b=float(base_p), p_b_given_a=float(means[j]),
+                lb=float(lbs_all[j]), ub=float(ubs_all[j]), n=int(n_samples[j]),
+            )
         else:
             success = True
 
@@ -944,7 +1005,9 @@ class AnchorBaseBeam:
             meta['score'] = [best_payload['score']]
             meta['objective_name'] = best_payload['score_name']
             meta['constraint_name'] = best_payload['constraint_name']
-            meta['all_precision'] = base_p
+            # keep the base rate; only set if not already provided
+            if 'all_precision' not in meta:
+                meta['all_precision'] = base_p
             meta['extra_stats'] = {
                 'p_a': best_payload['p_a'],
                 'p_b': best_payload['p_b'],
@@ -957,12 +1020,40 @@ class AnchorBaseBeam:
         if top_k_return and len(topk_heap) > 0:
             ranked = nlargest(min(top_k_return, len(topk_heap)), topk_heap, key=lambda x: x[0])
             meta["candidates"] = []
+
+            # --- NEW: skip the best anchor to avoid duplication
+            best_tuple = tuple(best_anchor)
+
             for _, p in ranked:
-                m = self.get_anchor_metadata(p["anchor"], True, batch_size=batch_size)
+                a = tuple(p["anchor"])
+                if a == best_tuple:
+                    continue  # already represented at top level
+
+                # only use get_anchor_metadata if we know it has samples; else manual record
+                has_samples = False
+                try:
+                    has_samples = (self.state["t_nsamples"].get(a, 0) > 0)
+                except Exception:
+                    has_samples = False
+
+                if has_samples:
+                    m = self.get_anchor_metadata(a, True, batch_size=batch_size)
+                else:
+                    m = {
+                        "feature": list(a),
+                        "precision": [p["p_b_given_a"]],
+                        "coverage": [p["p_a"]],
+                        "num_preds": p["n"],
+                        "examples": [],
+                        "success": True,
+                    }
+
                 m["score"] = [p["score"]]
                 m["objective_name"] = p["score_name"]
                 m["constraint_name"] = p["constraint_name"]
-                m["all_precision"] = p["p_b"]
+                # don't overwrite if get_anchor_metadata already supplied it
+                if "all_precision" not in m:
+                    m["all_precision"] = p["p_b"]
                 m["extra_stats"] = {
                     "p_a": p["p_a"],
                     "p_b": p["p_b"],
@@ -972,6 +1063,7 @@ class AnchorBaseBeam:
                     "n_samples": p["n"],
                 }
                 meta["candidates"].append(m)
+
             meta["top_k_return"] = len(meta["candidates"])
 
         return meta
