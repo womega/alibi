@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import numpy as np
 
@@ -18,6 +18,31 @@ class AnchorExplanation:
         """
         self.type = exp_type
         self.exp_map = exp_map
+    
+    def score(self, partial_index: Optional[int] = None) -> float:
+        """
+        Returns the objective score of the (partial) result.
+        If no per-step scores are stored, returns the final score or 0.0 if unavailable.
+        """
+        scores = self.exp_map.get('score', [])
+        if isinstance(scores, list) and len(scores) > 0:
+            if partial_index is not None:
+                return scores[partial_index if partial_index < len(scores) else -1]
+            return scores[-1]
+        # fallbacks
+        return float(self.exp_map.get('score', 0.0))
+
+    # NEW: helper to list all scores (if you decide to store per-index scores later)
+    def scores(self) -> List[float]:
+        s = self.exp_map.get('score', [])
+        return s if isinstance(s, list) else [float(s)] if s is not None else []
+
+    def objective_name(self) -> str:
+        return self.exp_map.get('objective_name', 'coverage')
+
+    def constraint_name(self) -> str:
+        return self.exp_map.get('constraint_name', 'lcb_precision')
+    
 
     def names(self, partial_index: Optional[int] = None) -> list:
         """

@@ -1,12 +1,77 @@
 import copy
 import logging
+from dataclasses import dataclass
 from collections import defaultdict, namedtuple
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
+from heapq import heappush, heappushpop, nlargest
 
 import numpy as np
 from alibi.utils.distributions import kl_bernoulli
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RuleBatchStats:
+    """Minimal stats needed to compute rule interestingness."""
+    p_a: np.ndarray              # P(A): coverage for each anchor
+    p_b_given_a: np.ndarray      # P(B|A): precision/mean for each anchor
+    p_b: float                   # P(B): base rate for the target label y
+    lb_prec: np.ndarray          # lower bound on precision
+    ub_prec: np.ndarray          # upper bound on precision
+    n: np.ndarray                # samples used to estimate p_b_given_a
+
+def obj_wracc(stats: RuleBatchStats) -> np.ndarray:
+    # WRAcc = P(A) * (P(B|A) - P(B)) == P(AB) - P(A)P(B)  (Hamilton survey) 
+    return stats.p_a * (stats.p_b_given_a - stats.p_b)
+
+def obj_leverage(stats: RuleBatchStats) -> np.ndarray:
+    # Leverage = P(AB) - P(A)P(B)
+    return stats.p_a * stats.p_b_given_a - stats.p_a * stats.p_b
+
+def obj_lift(stats: RuleBatchStats) -> np.ndarray:
+    # Lift = P(B|A) / P(B)
+    denom = max(stats.p_b, 1e-12)
+    return stats.p_b_given_a / denom
+
+def obj_jaccard(stats: RuleBatchStats) -> np.ndarray:
+    # Jaccard = P(AB) / (P(A)+P(B)-P(AB))
+    p_ab = stats.p_a * stats.p_b_given_a
+    denom = stats.p_a + stats.p_b - p_ab
+    out = np.zeros_like(p_ab)
+    mask = denom > 0
+    out[mask] = p_ab[mask] / denom[mask]
+    return out
+
+def obj_coverage(stats: RuleBatchStats) -> np.ndarray:
+    return stats.p_a
+
+# Registry
+OBJECTIVES: Dict[str, Callable[[RuleBatchStats], np.ndarray]] = {
+    "wracc": obj_wracc,
+    "leverage": obj_leverage,
+    "lift": obj_lift,
+    "jaccard": obj_jaccard,
+    "coverage": obj_coverage,  # default (backward compatible)
+}
+
+# Built-in constraints (vectorized; return boolean mask)
+def cons_lcb_precision(stats: RuleBatchStats, desired_conf: float, eps: float) -> np.ndarray:
+    # original behavior: means >= tau and LB > tau - eps
+    means = stats.p_b_given_a
+    return (means >= desired_conf) & (stats.lb_prec > (desired_conf - eps))
+
+def cons_effect_support(stats: RuleBatchStats, min_support: float = 0.01, min_lift: float = 1.5) -> np.ndarray:
+    return (stats.p_a >= min_support) & (obj_lift(stats) >= min_lift)
+
+def cons_min_leverage(stats: RuleBatchStats, min_lev: float = 0.001, min_support: float = 0.0) -> np.ndarray:
+    return (obj_leverage(stats) >= min_lev) & (stats.p_a >= min_support)
+
+CONSTRAINTS: Dict[str, Callable[..., np.ndarray]] = {
+    "lcb_precision": cons_lcb_precision,       # default (backward compatible)
+    "effect_support": cons_effect_support,
+    "min_leverage": cons_min_leverage,
+}
 
 
 # TODO: Discuss logging strategy
@@ -609,7 +674,10 @@ class AnchorBaseBeam:
                     beam_size: int = 1, epsilon_stop: float = 0.05, min_samples_start: int = 100,
                     max_anchor_size: Optional[int] = None, stop_on_first: bool = False, batch_size: int = 100,
                     coverage_samples: int = 10000, verbose: bool = False, verbose_every: int = 1,
-                    **kwargs) -> dict:
+                    objective: Union[str, Callable[[RuleBatchStats], np.ndarray]] = "coverage",
+                    constraint: Union[str, Callable[..., np.ndarray]] = "lcb_precision",
+                    constraint_kwargs: Optional[dict] = None,
+                    top_k_return: int = 1,**kwargs) -> dict:
 
         """
         Uses the KL-LUCB algorithm (Kaufmann and Kalyanakrishnan, 2013) together with additional sampling to search
@@ -619,6 +687,10 @@ class AnchorBaseBeam:
         makes the same prediction when queried with the feature subset combined with arbitrary samples drawn from a
         noise distribution). The algorithm maximises the coverage of the solution found - the frequency of occurrence
         of records containing the feature subset in set of samples.
+
+        Optimize an arbitrary objective M(A→y) under a reliability constraint (default = LCB-precision).
+        Defaults preserve original behavior: maximize coverage subject to precision (Anchors paper).
+    
 
         Parameters
         ----------
@@ -651,6 +723,12 @@ class AnchorBaseBeam:
         -------
         Explanation dictionary containing anchors with metadata like coverage and precision and examples.
         """
+        
+        if constraint_kwargs is None:
+            constraint_kwargs = {}
+
+        objective_fn = OBJECTIVES[objective] if isinstance(objective, str) else objective
+        constraint_fn = CONSTRAINTS[constraint] if isinstance(constraint, str) else constraint
 
         # Select coverage set and initialise object state
         coverage_data = self._get_coverage_samples(
@@ -691,9 +769,14 @@ class AnchorBaseBeam:
                 'success': True,
             }
 
-        current_size, best_coverage = 1, -1
+        current_size = 1
+        best_score = -np.inf
         best_of_size: Dict[int, list] = {0: []}
         best_anchor = ()
+        best_payload = None
+        topk_heap = []
+        seen = set()  # avoid duplicates across sizes
+
 
         if max_anchor_size is None:
             max_anchor_size = self.state['n_features']
@@ -703,10 +786,7 @@ class AnchorBaseBeam:
 
             # create new candidate anchors by adding features to current best anchors
             anchors = self.propose_anchors(best_of_size[current_size - 1])
-            # goal is to max coverage given precision constraint P(prec(A) > tau) > 1 - delta (eq.4)
-            # so keep tuples with higher coverage than current best coverage
-            anchors = [anchor for anchor in anchors if self.state['t_coverage'][anchor] > best_coverage]
-
+            
             # if no better coverage found with added features -> break
             if len(anchors) == 0:
                 break
@@ -764,29 +844,70 @@ class AnchorBaseBeam:
 
             # anchors who meet the precision setting and have better coverage than the best anchors so far
             coverages = stats['coverages']
-            valid_anchors = (means >= desired_confidence) & (lbs > desired_confidence - epsilon_stop)
-            better_anchors = (valid_anchors & (coverages > best_coverage)).nonzero()[0]
+            base_p = self.state.get('all_precision', None)
+            if base_p is None:
+                # fallback: estimate once by drawing with empty anchor
+                pos_b, tot_b = self.draw_samples([()], max(100, batch_size))
+                base_p = float(pos_b) / float(tot_b)
 
+            rb = RuleBatchStats(
+                p_a=coverages,
+                p_b_given_a=means,
+                p_b=base_p,
+                lb_prec=lbs,
+                ub_prec=ubs,
+                n=n_samples,
+            )
+            valid_mask = constraint_fn(rb, desired_confidence, epsilon_stop, **constraint_kwargs) \
+                        if constraint_fn is cons_lcb_precision else constraint_fn(rb, **constraint_kwargs)
+            scores = objective_fn(rb)
+
+            # pick candidates with better score than best so far
+            # log candidates of this size (optional)
             if verbose:
-                for i, valid, mean, lb, ub, coverage in \
-                        zip(candidate_anchors, valid_anchors, means, lbs, ubs, coverages):
-                    t = anchors[i]
-                    print(
-                        '%s mean = %.2f lb = %.2f ub = %.2f coverage: %.2f n: %d' %
-                        (t, mean, lb, ub, coverage, self.state['t_nsamples'][t]))
-                    if valid:
-                        print(
-                            'Found eligible result ', t,
-                            'Coverage:', coverage,
-                            'Is best?', coverage > best_coverage,
-                        )
+                print('Best of size ', current_size, ':')
+                for i in range(len(best_of_size[current_size])):
+                    t = best_of_size[current_size][i]
+                    print(f'{t} mean={means[i]:.3f} lb={lbs[i]:.3f} ub={ubs[i]:.3f} P(A)={coverages[i]:.3f} '
+                        f'score={scores[i]:.4f} valid={bool(valid_mask[i])}')
 
-            if better_anchors.size > 0:
-                best_anchor_idx = better_anchors[np.argmax(coverages[better_anchors])]
-                best_coverage = coverages[best_anchor_idx]
-                best_anchor = anchors[candidate_anchors[best_anchor_idx]]
-                if best_coverage == 1. or stop_on_first:
-                    break
+            # --- collect top-K valid anchors by objective ---
+            for idx in range(len(best_of_size[current_size])):
+                if not valid_mask[idx]:
+                    continue
+                a = best_of_size[current_size][idx]
+                if a in seen:
+                    continue
+                seen.add(a)
+
+                payload = dict(
+                    anchor=a,
+                    score=float(scores[idx]),
+                    score_name=(objective if isinstance(objective, str) else objective.__name__),
+                    constraint_name=(constraint if isinstance(constraint, str) else constraint.__name__),
+                    p_a=float(coverages[idx]),
+                    p_b=float(base_p),
+                    p_b_given_a=float(means[idx]),
+                    lb=float(lbs[idx]),
+                    ub=float(ubs[idx]),
+                    n=int(n_samples[idx]),
+                )
+
+                # maintain a min-heap of size <= top_k_return
+                if top_k_return > 0:
+                    if len(topk_heap) < top_k_return:
+                        heappush(topk_heap, (payload["score"], payload))
+                    elif payload["score"] > topk_heap[0][0]:
+                        heappushpop(topk_heap, (payload["score"], payload))
+
+                # keep backward-compatible "single best" selection
+                if payload["score"] > best_score:
+                    best_score = payload["score"]
+                    best_anchor = a
+                    best_payload = payload
+                    if stop_on_first:
+                        break
+
 
             current_size += 1
 
@@ -816,4 +937,41 @@ class AnchorBaseBeam:
         else:
             success = True
 
-        return self.get_anchor_metadata(best_anchor, success, batch_size=batch_size)
+        meta = self.get_anchor_metadata(best_anchor, success, batch_size=batch_size)
+
+        # single best (backward compatible)
+        if best_payload:
+            meta['score'] = [best_payload['score']]
+            meta['objective_name'] = best_payload['score_name']
+            meta['constraint_name'] = best_payload['constraint_name']
+            meta['all_precision'] = base_p
+            meta['extra_stats'] = {
+                'p_a': best_payload['p_a'],
+                'p_b': best_payload['p_b'],
+                'p_b_given_a': best_payload['p_b_given_a'],
+                'lb_precision': best_payload['lb'],
+                'ub_precision': best_payload['ub'],
+                'n_samples': best_payload['n'],
+            }
+
+        if top_k_return and len(topk_heap) > 0:
+            ranked = nlargest(min(top_k_return, len(topk_heap)), topk_heap, key=lambda x: x[0])
+            meta["candidates"] = []
+            for _, p in ranked:
+                m = self.get_anchor_metadata(p["anchor"], True, batch_size=batch_size)
+                m["score"] = [p["score"]]
+                m["objective_name"] = p["score_name"]
+                m["constraint_name"] = p["constraint_name"]
+                m["all_precision"] = p["p_b"]
+                m["extra_stats"] = {
+                    "p_a": p["p_a"],
+                    "p_b": p["p_b"],
+                    "p_b_given_a": p["p_b_given_a"],
+                    "lb_precision": p["lb"],
+                    "ub_precision": p["ub"],
+                    "n_samples": p["n"],
+                }
+                meta["candidates"].append(m)
+            meta["top_k_return"] = len(meta["candidates"])
+
+        return meta

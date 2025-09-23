@@ -350,8 +350,10 @@ class AnchorText(Explainer):
         text
             Text instance to be explained.
         threshold
-            Minimum anchor precision threshold. The algorithm tries to find an anchor that maximizes the coverage
-            under precision constraint. The precision constraint is formally defined as
+            Minimum anchor precision threshold. The algorithm tries to find an anchor that maximizes an objective
+            under a desired constraint. 
+            
+            The precision constraint is formally defined as
             :math:`P(prec(A) \\ge t) \\ge 1 - \\delta`, where :math:`A` is an anchor, :math:`t` is the `threshold`
             parameter, :math:`\\delta` is the `delta` parameter, and :math:`prec(\\cdot)` denotes the precision
             of an anchor. In other words, we are seeking for an anchor having its precision greater or equal than
