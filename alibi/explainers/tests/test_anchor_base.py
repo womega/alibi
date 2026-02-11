@@ -57,3 +57,18 @@ def test_anchor_base_beam(rf_classifier, at_defaults, at_iris_explainer):
     # test coverage data sampling
     cov_data = anchor_beam._get_coverage_samples(coverage_samples)
     assert cov_data.shape[0] == coverage_samples
+
+
+def test_anchor_base_memory_saver_mode(at_iris_explainer, at_defaults):
+    X_test, explainer, _, _ = at_iris_explainer
+    threshold = at_defaults['desired_confidence']
+    explanation = explainer.explain(
+        X_test[0],
+        threshold=threshold,
+        **at_defaults,
+        memory_saver_mode=True,
+        adaptive_budget=True,
+        max_perturbation_batch_size=16,
+    )
+    assert 'instrumentation' in explanation.raw
+    assert explanation.raw['instrumentation']['samples_drawn'] > 0

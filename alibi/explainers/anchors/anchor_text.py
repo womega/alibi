@@ -176,6 +176,12 @@ class AnchorText(Explainer):
             If the return type of `predictor` is not `np.ndarray`.
         """
         super().__init__(meta=copy.deepcopy(DEFAULT_META_ANCHOR))
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+        self.model_calls: int = 0
+        self.perturbation_samples_evaluated: int = 0
+        self.max_perturbation_batch_size: Optional[int] = None
+        self.stream_text_sampling: bool = True
         self._seed(seed)
 
         # set the predictor
@@ -295,18 +301,50 @@ class AnchorText(Explainer):
         Otherwise, a list containing the data matrix only is returned.
         """
 
-        raw_data, data = self.perturbation(anchor[1], num_samples)
+        if not compute_labels:
+            if hasattr(self.perturbation, 'sample_masks'):
+                return [self.perturbation.sample_masks(anchor[1], num_samples)]
+            _, data = self.perturbation(anchor[1], num_samples)
+            return [data]
 
-        # create labels using model predictions as true labels
-        if compute_labels:
+        if not self.stream_text_sampling:
+            raw_data, data = self.perturbation(anchor[1], num_samples)
             labels = self.compare_labels(raw_data)
             covered_true = raw_data[labels][:self.n_covered_ex]
             covered_false = raw_data[np.logical_not(labels)][:self.n_covered_ex]
+            return [covered_true, covered_false, labels.astype(np.uint8), data, -1.0, anchor[0]]
 
-            # coverage set to -1.0 as we can't compute 'true' coverage for this model
-            return [covered_true, covered_false, labels.astype(int), data, -1.0, anchor[0]]
-        else:
-            return [data]
+        chunk_size = self.max_perturbation_batch_size or num_samples
+        data_chunks = []
+        labels_chunks = []
+        covered_true_buf: List[str] = []
+        covered_false_buf: List[str] = []
+
+        for raw_chunk, data_chunk in self.perturbation.stream_samples(anchor[1], num_samples, chunk_size):
+            preds = self.predictor(raw_chunk.tolist())
+            self.model_calls += 1
+            self.perturbation_samples_evaluated += len(raw_chunk)
+            labels_chunk = (preds == self.instance_label)
+            data_chunks.append(data_chunk)
+            labels_chunks.append(labels_chunk.astype(np.uint8))
+
+            if len(covered_true_buf) < self.n_covered_ex:
+                for txt in raw_chunk[labels_chunk]:
+                    covered_true_buf.append(txt)
+                    if len(covered_true_buf) >= self.n_covered_ex:
+                        break
+            if len(covered_false_buf) < self.n_covered_ex:
+                for txt in raw_chunk[np.logical_not(labels_chunk)]:
+                    covered_false_buf.append(txt)
+                    if len(covered_false_buf) >= self.n_covered_ex:
+                        break
+
+        data = np.vstack(data_chunks) if data_chunks else np.zeros((0, 0), dtype=np.uint8)
+        labels = np.concatenate(labels_chunks) if labels_chunks else np.zeros((0,), dtype=np.uint8)
+        covered_true = np.asarray(covered_true_buf, dtype=object)
+        covered_false = np.asarray(covered_false_buf, dtype=object)
+
+        return [covered_true, covered_false, labels.astype(np.uint8), data, -1.0, anchor[0]]
 
     def compare_labels(self, samples: np.ndarray) -> np.ndarray:
         """
@@ -323,7 +361,15 @@ class AnchorText(Explainer):
         -------
         A `numpy` boolean array indicating whether the prediction was the same as the instance label.
         """
-        return self.predictor(samples.tolist()) == self.instance_label
+        max_batch = self.max_perturbation_batch_size or samples.shape[0]
+        labels = np.empty(samples.shape[0], dtype=bool)
+        for start in range(0, samples.shape[0], max_batch):
+            stop = min(start + max_batch, samples.shape[0])
+            preds = self.predictor(samples[start:stop].tolist())
+            self.model_calls += 1
+            self.perturbation_samples_evaluated += (stop - start)
+            labels[start:stop] = (preds == self.instance_label)
+        return labels
 
     def explain(self,  # type: ignore[override]
                 text: str,
@@ -431,9 +477,16 @@ class AnchorText(Explainer):
 
         # store n_covered_ex positive/negative examples for each anchor
         self.n_covered_ex = n_covered_ex
+        self.model_calls = 0
+        self.perturbation_samples_evaluated = 0
+        self.max_perturbation_batch_size = kwargs.get('max_perturbation_batch_size')
+        self.stream_text_sampling = bool(kwargs.get('stream_text_sampling', True))
         self.instance_label = self.predictor([text])[0]
+        self.model_calls += 1
+        self.perturbation_samples_evaluated += 1
 
         # set sampler
+        self.perturbation.set_seed(self.rng.integers(0, np.iinfo(np.int32).max, dtype=np.int32).item())
         self.perturbation.set_text(text)
 
         # get anchors and add metadata
@@ -441,6 +494,7 @@ class AnchorText(Explainer):
             samplers=[self.sampler],
             sample_cache_size=binary_cache_size,
             cache_margin=cache_margin,
+            stats_provider=self,
             **kwargs
         )
 
@@ -546,7 +600,10 @@ class AnchorText(Explainer):
         self.predictor = self._transform_predictor(predictor)
 
     def _seed(self, seed: int) -> None:
-        np.random.seed(seed)
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+        if hasattr(self, 'perturbation') and hasattr(self.perturbation, 'set_seed'):
+            self.perturbation.set_seed(seed)
         # If LanguageModel is used, we need to set the seed for tf as well.
         if hasattr(self, 'model') and isinstance(self.model, LanguageModelSampler):
             self.perturbation.seed(seed)

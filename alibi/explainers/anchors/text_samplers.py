@@ -119,6 +119,12 @@ def load_spacy_lexeme_prob(nlp: 'spacy.language.Language') -> 'spacy.language.La
 
 
 class AnchorTextSampler:
+    def __init__(self) -> None:
+        self.rng = np.random.default_rng(0)
+
+    def set_seed(self, seed: int) -> None:
+        self.rng = np.random.default_rng(seed)
+
     @abstractmethod
     def set_text(self, text: str) -> None:
         pass
@@ -126,6 +132,18 @@ class AnchorTextSampler:
     @abstractmethod
     def __call__(self, anchor: tuple, num_samples: int) -> Tuple[np.ndarray, np.ndarray]:
         pass
+
+    def stream_samples(self, anchor: tuple, num_samples: int, chunk_size: int):
+        remaining = num_samples
+        while remaining > 0:
+            n_chunk = min(chunk_size, remaining)
+            raw, data = self(anchor, n_chunk)
+            yield raw, data
+            remaining -= n_chunk
+
+    def sample_masks(self, anchor: tuple, num_samples: int) -> np.ndarray:
+        _, data = self(anchor, num_samples)
+        return data
 
     def _joiner(self, arr: np.ndarray, dtype: Optional[str] = None) -> np.ndarray:
         """
@@ -214,7 +232,7 @@ class UnknownSampler(AnchorTextSampler):
         assert self.perturb_opts, "Perturbation options are not set."
 
         # allocate memory for the binary mask and the perturbed instances
-        data = np.ones((num_samples, len(self.words)))
+        data = np.ones((num_samples, len(self.words)), dtype=np.uint8)
         raw = np.zeros((num_samples, len(self.words)), self.dtype)
 
         # fill each row of the raw data matrix with the text instance to be explained
@@ -226,14 +244,27 @@ class UnknownSampler(AnchorTextSampler):
                 continue
 
             # sample the words in the text outside of the anchor that are replaced with UNKs
-            n_changed = np.random.binomial(num_samples, self.perturb_opts['sample_proba'])
-            changed = np.random.choice(num_samples, n_changed, replace=False)
+            n_changed = self.rng.binomial(num_samples, self.perturb_opts['sample_proba'])
+            changed = self.rng.choice(num_samples, n_changed, replace=False)
             raw[changed, i] = UnknownSampler.UNK
             data[changed, i] = 0
 
         # join the words
-        raw = np.apply_along_axis(self._joiner, axis=1, arr=raw, dtype=self.dtype)
+        raw = np.fromiter((' '.join(row) for row in raw), dtype=self.dtype, count=raw.shape[0])
         return raw, data
+
+    def sample_masks(self, anchor: tuple, num_samples: int) -> np.ndarray:
+        assert self.perturb_opts, "Perturbation options are not set."
+        data = np.ones((num_samples, len(self.words)), dtype=np.uint8)
+        for i, _ in enumerate(self.words):
+            if i in anchor:
+                continue
+            n_changed = self.rng.binomial(num_samples, self.perturb_opts['sample_proba'])
+            if n_changed == 0:
+                continue
+            changed = self.rng.choice(num_samples, n_changed, replace=False)
+            data[changed, i] = 0
+        return data
 
     def set_data_type(self) -> None:
         """
@@ -377,7 +408,7 @@ class SimilaritySampler(AnchorTextSampler):
         """
         # allocate memory for the binary mask and the perturbed instances
         raw = np.zeros((n, len(self.tokens)), self.dtype)
-        data = np.ones((n, len(self.tokens)))
+        data = np.ones((n, len(self.tokens)), dtype=np.uint8)
 
         # fill each row of the raw data matrix with the text to be explained
         raw[:] = [x.text for x in self.tokens]
@@ -396,8 +427,8 @@ class SimilaritySampler(AnchorTextSampler):
                 if t_neighbors.size == 0:
                     continue
 
-                n_changed = np.random.binomial(n, sample_proba)
-                changed = np.random.choice(n, n_changed, replace=False)
+                n_changed = self.rng.binomial(n, sample_proba)
+                changed = self.rng.choice(n, n_changed, replace=False)
 
                 if use_proba:  # use similarity scores to sample changed tokens
                     weights = self.synonyms[t.text]['similarities']
@@ -407,11 +438,24 @@ class SimilaritySampler(AnchorTextSampler):
                     weights = np.ones((t_neighbors.shape[0],))
                     weights /= t_neighbors.shape[0]
 
-                raw[changed, i] = np.random.choice(t_neighbors, n_changed, p=weights, replace=True)
+                raw[changed, i] = self.rng.choice(t_neighbors, n_changed, p=weights, replace=True)
                 data[changed, i] = 0
 
-        raw = np.apply_along_axis(self._joiner, axis=1, arr=raw, dtype=self.dtype)
+        raw = np.fromiter((' '.join(row) for row in raw), dtype=self.dtype, count=raw.shape[0])
         return raw, data
+
+    def sample_masks(self, anchor: tuple, num_samples: int) -> np.ndarray:
+        assert self.perturb_opts, "Perturbation options are not set."
+        data = np.ones((num_samples, len(self.words)), dtype=np.uint8)
+        for i, _ in enumerate(self.words):
+            if i in anchor:
+                continue
+            n_changed = self.rng.binomial(num_samples, self.perturb_opts['sample_proba'])
+            if n_changed == 0:
+                continue
+            changed = self.rng.choice(num_samples, n_changed, replace=False)
+            data[changed, i] = 0
+        return data
 
     def set_data_type(self) -> None:
         """

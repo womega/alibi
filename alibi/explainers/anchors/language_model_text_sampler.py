@@ -289,8 +289,8 @@ class LanguageModelSampler(AnchorTextSampler):
                 # is much easier to ensure that at least one word in the sentence is masked.
                 # If the sampling is performed over the columns it might be the case
                 # that no word in a sentence will be masked.
-                n_changed = max(1, np.random.binomial(len(allowed_indices), sample_proba))
-                changed = np.random.choice(allowed_indices, n_changed, replace=False)
+                n_changed = max(1, self.rng.binomial(len(allowed_indices), sample_proba))
+                changed = self.rng.choice(allowed_indices, n_changed, replace=False)
 
                 # mark the entrance as maks
                 data[i, changed] = 0
@@ -305,7 +305,7 @@ class LanguageModelSampler(AnchorTextSampler):
                     self._remove_subwords(raw=raw, row=i, col=j, **kwargs)
 
         # join words
-        raw = np.apply_along_axis(self._joiner, axis=1, arr=raw, dtype=self.dtype_sent)
+        raw = np.fromiter((self._joiner(row, self.dtype_sent).item() for row in raw), dtype=self.dtype_sent, count=raw.shape[0])
         return raw, data
 
     def _append_tail(self, raw: np.ndarray) -> np.ndarray:
