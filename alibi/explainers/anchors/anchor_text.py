@@ -1,6 +1,7 @@
 import copy
 import logging
 import string
+import time
 from copy import deepcopy
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union)
 
@@ -182,6 +183,9 @@ class AnchorText(Explainer):
         self.perturbation_samples_evaluated: int = 0
         self.max_perturbation_batch_size: Optional[int] = None
         self.stream_text_sampling: bool = True
+        self.predictor_time_s: float = 0.0
+        self.conversion_time_s: float = 0.0
+        self.conversion_counts: Dict[str, int] = {'to_list': 0, 'predictor_output_to_numpy': 0}
         self._seed(seed)
 
         # set the predictor
@@ -321,7 +325,7 @@ class AnchorText(Explainer):
         covered_false_buf: List[str] = []
 
         for raw_chunk, data_chunk in self.perturbation.stream_samples(anchor[1], num_samples, chunk_size):
-            preds = self.predictor(raw_chunk.tolist())
+            preds = self._predict_classes(raw_chunk)
             self.model_calls += 1
             self.perturbation_samples_evaluated += len(raw_chunk)
             labels_chunk = (preds == self.instance_label)
@@ -365,7 +369,7 @@ class AnchorText(Explainer):
         labels = np.empty(samples.shape[0], dtype=bool)
         for start in range(0, samples.shape[0], max_batch):
             stop = min(start + max_batch, samples.shape[0])
-            preds = self.predictor(samples[start:stop].tolist())
+            preds = self._predict_classes(samples[start:stop])
             self.model_calls += 1
             self.perturbation_samples_evaluated += (stop - start)
             labels[start:stop] = (preds == self.instance_label)
@@ -481,6 +485,11 @@ class AnchorText(Explainer):
         self.perturbation_samples_evaluated = 0
         self.max_perturbation_batch_size = kwargs.get('max_perturbation_batch_size')
         self.stream_text_sampling = bool(kwargs.get('stream_text_sampling', True))
+        self.predictor_time_s = 0.0
+        self.conversion_time_s = 0.0
+        self.conversion_counts = {'to_list': 0, 'predictor_output_to_numpy': 0}
+        if hasattr(self.perturbation, 'timing'):
+            self.perturbation.timing = {k: 0.0 if isinstance(v, float) else 0 for k, v in self.perturbation.timing.items()}
         self.instance_label = self.predictor([text])[0]
         self.model_calls += 1
         self.perturbation_samples_evaluated += 1
@@ -512,6 +521,14 @@ class AnchorText(Explainer):
             verbose_every=verbose_every,
             **kwargs,
         )
+        if isinstance(result, dict):
+            inst = result.get('instrumentation', {})
+            inst['predictor_time_s'] = self.predictor_time_s
+            inst['conversion_time_s'] = self.conversion_time_s
+            inst['conversion_counts'] = copy.deepcopy(self.conversion_counts)
+            if hasattr(self.perturbation, 'timing'):
+                inst['text_sampler_timing'] = copy.deepcopy(self.perturbation.timing)
+            result['instrumentation'] = inst
 
         if self.sampling_strategy == self.SAMPLING_LANGUAGE_MODEL:
             # take the whole word (this points just to the first part of the word)
@@ -567,6 +584,14 @@ class AnchorText(Explainer):
         # explanation.meta['params'].update(params)
         return explanation
 
+    @staticmethod
+    def _to_numpy_output(prediction: Any) -> np.ndarray:
+        if isinstance(prediction, np.ndarray):
+            return prediction
+        if hasattr(prediction, 'detach') and hasattr(prediction, 'cpu') and hasattr(prediction, 'numpy'):
+            return prediction.detach().cpu().numpy()
+        return np.asarray(prediction)
+
     def _transform_predictor(self, predictor: Callable) -> Callable:
         # check if predictor returns predicted class or prediction probabilities for each class
         # if needed adjust predictor so it returns the predicted class
@@ -578,15 +603,34 @@ class AnchorText(Explainer):
                   f"Check that `predictor` works with inputs of type List[str]."
             raise PredictorCallError(msg) from e
 
-        if not isinstance(prediction, np.ndarray):
-            msg = f"Excepted predictor return type to be {np.ndarray} but got {type(prediction)}."
+        prediction = self._to_numpy_output(prediction)
+        if prediction.ndim == 0:
+            msg = f"Excepted predictor return array-like with at least 1 dimension but got shape {prediction.shape}."
             raise PredictorReturnTypeError(msg)
 
         if np.argmax(prediction.shape) == 0:
             return predictor
         else:
-            transformer = ArgmaxTransformer(predictor)
+            transformer = ArgmaxTransformer(lambda x: self._to_numpy_output(predictor(x)))
             return transformer
+
+    def _predict_classes(self, samples: np.ndarray) -> np.ndarray:
+        t_conv = time.perf_counter()
+        payload = samples.tolist()
+        self.conversion_counts['to_list'] += 1
+        self.conversion_time_s += time.perf_counter() - t_conv
+
+        t_pred = time.perf_counter()
+        preds = self.predictor(payload)
+        self.predictor_time_s += time.perf_counter() - t_pred
+
+        if not isinstance(preds, np.ndarray):
+            t_out = time.perf_counter()
+            preds = self._to_numpy_output(preds)
+            self.conversion_counts['predictor_output_to_numpy'] += 1
+            self.conversion_time_s += time.perf_counter() - t_out
+
+        return preds
 
     def reset_predictor(self, predictor: Callable) -> None:
         """
