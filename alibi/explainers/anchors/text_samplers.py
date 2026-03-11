@@ -238,9 +238,10 @@ class UnknownSampler(AnchorTextSampler):
         # fill each row of the raw data matrix with the text instance to be explained
         raw[:] = self.words
 
+        anchor_set = set(anchor)
         for i, t in enumerate(self.words):
             # do not perturb words that are in anchor
-            if i in anchor:
+            if i in anchor_set:
                 continue
 
             # sample the words in the text outside of the anchor that are replaced with UNKs
@@ -256,8 +257,9 @@ class UnknownSampler(AnchorTextSampler):
     def sample_masks(self, anchor: tuple, num_samples: int) -> np.ndarray:
         assert self.perturb_opts, "Perturbation options are not set."
         data = np.ones((num_samples, len(self.words)), dtype=np.uint8)
+        anchor_set = set(anchor)
         for i, _ in enumerate(self.words):
-            if i in anchor:
+            if i in anchor_set:
                 continue
             n_changed = self.rng.binomial(num_samples, self.perturb_opts['sample_proba'])
             if n_changed == 0:
@@ -413,9 +415,10 @@ class SimilaritySampler(AnchorTextSampler):
         # fill each row of the raw data matrix with the text to be explained
         raw[:] = [x.text for x in self.tokens]
 
+        present_set = set(present)
         for i, t in enumerate(self.tokens):  # apply sampling to each token
             # if the word is part of the anchor, move on to next token
-            if i in present:
+            if i in present_set:
                 continue
 
             # check that token does not fall in any forbidden category
@@ -447,8 +450,9 @@ class SimilaritySampler(AnchorTextSampler):
     def sample_masks(self, anchor: tuple, num_samples: int) -> np.ndarray:
         assert self.perturb_opts, "Perturbation options are not set."
         data = np.ones((num_samples, len(self.words)), dtype=np.uint8)
+        anchor_set = set(anchor)
         for i, _ in enumerate(self.words):
-            if i in anchor:
+            if i in anchor_set:
                 continue
             n_changed = self.rng.binomial(num_samples, self.perturb_opts['sample_proba'])
             if n_changed == 0:

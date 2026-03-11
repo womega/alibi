@@ -153,3 +153,94 @@ python -m compileall alibi/explainers/anchors/anchor_base.py \
 
 python -m unittest alibi.explainers.tests.test_anchor_text_optimization_unittest -v
 ```
+
+## Practical AnchorText config guidance (text classification)
+
+### Why anchors may be missing
+- High `threshold` with an LCB precision constraint (`constraint='lcb_precision'`) can reject otherwise good anchors because both empirical precision and lower bound must pass.
+- Large search breadth (`top_k_return>1`, wider objectives) raises sampling burden and can dilute exploration under fixed budget.
+- For sparse/high-dimensional text, requiring very high precision (e.g. `0.95`) often makes anchors rare unless perturbations are very conservative.
+
+### Recommended config grid
+
+```json
+{
+  "small_debug": [
+    {
+      "anchor_objective": "coverage",
+      "anchor_constraint": "lcb_precision",
+      "anchor_threshold": 0.85,
+      "anchor_batch_size": 128,
+      "anchor_coverage_samples": 1000,
+      "anchor_top_k_return": 1,
+      "anchor_verbose": false,
+      "anchor_verbose_every": 25
+    },
+    {
+      "anchor_objective": "coverage",
+      "anchor_constraint": "lcb_precision",
+      "anchor_threshold": 0.88,
+      "anchor_batch_size": 128,
+      "anchor_coverage_samples": 1500,
+      "anchor_top_k_return": 1,
+      "anchor_verbose": false,
+      "anchor_verbose_every": 25
+    }
+  ],
+  "default_production": [
+    {
+      "anchor_objective": "coverage",
+      "anchor_constraint": "lcb_precision",
+      "anchor_threshold": 0.9,
+      "anchor_batch_size": 128,
+      "anchor_coverage_samples": 2500,
+      "anchor_top_k_return": 1,
+      "anchor_verbose": false,
+      "anchor_verbose_every": 50
+    },
+    {
+      "anchor_objective": "wracc",
+      "anchor_constraint": "lcb_precision",
+      "anchor_threshold": 0.9,
+      "anchor_batch_size": 128,
+      "anchor_coverage_samples": 3000,
+      "anchor_top_k_return": 1,
+      "anchor_verbose": false,
+      "anchor_verbose_every": 50
+    }
+  ],
+  "high_quality_expensive": [
+    {
+      "anchor_objective": "coverage",
+      "anchor_constraint": "lcb_precision",
+      "anchor_threshold": 0.92,
+      "anchor_batch_size": 128,
+      "anchor_coverage_samples": 5000,
+      "anchor_top_k_return": 1,
+      "anchor_verbose": false,
+      "anchor_verbose_every": 50
+    },
+    {
+      "anchor_objective": "wracc",
+      "anchor_constraint": "lcb_precision",
+      "anchor_threshold": 0.92,
+      "anchor_batch_size": 128,
+      "anchor_coverage_samples": 6000,
+      "anchor_top_k_return": 1,
+      "anchor_verbose": false,
+      "anchor_verbose_every": 50
+    }
+  ]
+}
+```
+
+### Settings to de-prioritize
+- `anchor_threshold=0.95` for initial sweeps (usually too strict for text under LCB constraints).
+- `anchor_top_k_return>1` in normal runs; use only for audit runs due to extra metadata/resampling overhead.
+- `anchor_objective='lift'` as default: unstable when base rate is small and often slower to converge in practice.
+
+### Objective/constraint recommendation
+- Keep: `coverage` + `lcb_precision` as primary default.
+- Optional: `wracc` for more class-contrastive rules after a viable `coverage` setup is validated.
+- Use `lift` sparingly for specialist analysis.
+
