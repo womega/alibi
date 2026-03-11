@@ -491,19 +491,17 @@ class LanguageModelSampler(AnchorTextSampler):
 
         # select rows and cols where the input the tokens are masked
         tokens = tokens_plus['input_ids']  # (mask_template x max_length_sentence)
-        mask_pos = tf.where(tokens == self.model.mask_id)
+        tokens_np = tokens.numpy()
+        mask_pos = tf.where(tokens == self.model.mask_id).numpy()
         mask_row, mask_col = mask_pos[:, 0], mask_pos[:, 1]
 
         # buffer containing sampled tokens
-        sampled_tokens = np.zeros((num_samples, tokens.shape[1]), dtype=np.int32)
-        sampled_data = np.zeros((num_samples, data.shape[1]))
+        sampled_tokens = np.zeros((num_samples, tokens_np.shape[1]), dtype=np.int32)
+        sampled_data = np.zeros((num_samples, data.shape[1]), dtype=data.dtype)
 
         for i in range(logits.shape[0]):
-            # select indices corresponding to the current row `i`
-            idx = tf.reshape(tf.where(mask_row == i), shape=-1)
-
             # select columns corresponding to the current row `i`
-            cols = tf.gather(mask_col, idx)
+            cols = mask_col[mask_row == i]
 
             # select the logits of the masked input
             logits_mask = logits[i, cols, :]
@@ -516,22 +514,21 @@ class LanguageModelSampler(AnchorTextSampler):
             top_k_logits, top_k_tokens = top_k.values, top_k.indices
             top_k_logits = (top_k_logits / temperature) if use_proba else (top_k_logits * 0)
 
-            # sample `num_samples` instance for the current mask template
-            for j in range(mult_factor + int(i < remainder)):
-                # Compute the buffer index
-                idx = i * mult_factor + j + min(i, remainder)
+            # sample `num_samples` instances for the current mask template
+            n_rep = mult_factor + int(i < remainder)
+            start = i * mult_factor + min(i, remainder)
+            stop = start + n_rep
 
-                # Sample indices
-                ids_k = tf.reshape(tf.random.categorical(top_k_logits, 1), shape=-1)
+            sampled_tokens[start:stop] = np.repeat(tokens_np[i:i + 1], n_rep, axis=0)
 
-                # Set the unmasked tokens and for the masked one and replace them with the samples drawn
-                sampled_tokens[idx] = tokens[i]
-                sampled_tokens[idx, cols] = tf.gather(top_k_tokens, ids_k, batch_dims=1)
+            n_masks = int(top_k_logits.shape[0])
+            tiled_logits = tf.repeat(top_k_logits, repeats=n_rep, axis=0)
+            ids_k = tf.reshape(tf.random.categorical(tiled_logits, 1), (n_rep, n_masks)).numpy()
+            sampled_tokens[start:stop, cols] = np.take_along_axis(top_k_tokens.numpy(), ids_k, axis=1)
 
             # Add the original binary mask which marks the beginning of a masked
             # word, as is needed for the anchor algorithm (backend stuff)
-            idx, offset = i * mult_factor, min(i, remainder)
-            sampled_data[idx + offset:idx + mult_factor + offset + (i < remainder)] = data[i]
+            sampled_data[start:stop] = data[i]
 
         # Check that there are not masked tokens left
         assert np.all(sampled_tokens != self.model.mask_id)
