@@ -465,91 +465,66 @@ class LanguageModelSampler(AnchorTextSampler):
                                     **kwargs) -> Tuple[np.ndarray, np.ndarray]:
         """
         Perturb the instances in a single forward pass (parallel).
-
-        Parameters
-        ----------
-        num_samples
-            Number of samples to be generated
-        raw
-            Array of mask templates. Has `mask_templates` rows.
-        data
-            Binary array having 0 where the tokens are masked. Has `mask_templates` rows.
-        top_n:
-            Use the top n words when sampling.
-        batch_size_lm:
-            Batch size used for language model.
-        temperature
-            Sample weight hyper-parameter.
-        use_proba
-            Bool whether to sample according to the predicted words distribution
-        **kwargs
-            Other arguments. Not used.
-
-        Returns
-        -------
-        sampled_tokens
-            Array containing the ids of the sampled tokens. Has `num_samples` rows.
-        sampled_data
-            Binary array having 0 where the tokens were masked. Has `num_samples` rows.
         """
-        # tokenize instances
         tokens_plus = self.model.tokenizer.batch_encode_plus(list(raw), padding=True, return_tensors='np')
 
-        # number of samples to generate per mask template
         remainder = num_samples % len(raw)
         mult_factor = num_samples // len(raw)
 
-        # fill in masks with language model
-        # (mask_template x max_length_sentence x num_tokens)
-        logits = self.model.predict_batch_lm(x=tokens_plus,
-                                             vocab_size=self.model.tokenizer.vocab_size,
-                                             batch_size=batch_size_lm)
-        self.timing['lm_forward_calls'] += 1
-
-        # select rows and cols where the input the tokens are masked
-        tokens_np = tokens_plus['input_ids']  # (mask_template x max_length_sentence)
+        tokens_np = tokens_plus['input_ids']
         mask_pos = np.argwhere(tokens_np == self.model.mask_id)
         mask_row, mask_col = mask_pos[:, 0], mask_pos[:, 1]
 
-        # buffer containing sampled tokens
         sampled_tokens = np.zeros((num_samples, tokens_np.shape[1]), dtype=np.int32)
         sampled_data = np.zeros((num_samples, data.shape[1]), dtype=data.dtype)
 
-        for i in range(logits.shape[0]):
-            # select columns corresponding to the current row `i`
-            cols = mask_col[mask_row == i]
+        n_templates = tokens_np.shape[0]
+        for b_start in range(0, n_templates, batch_size_lm):
+            b_stop = min(b_start + batch_size_lm, n_templates)
+            x_batch = {k: v[b_start:b_stop] for k, v in tokens_plus.items()}
+            logits_batch = self.model.predict_batch_lm(
+                x=x_batch,
+                vocab_size=self.model.tokenizer.vocab_size,
+                batch_size=batch_size_lm,
+            )
+            self.timing['lm_forward_calls'] += 1
 
-            # select the logits of the masked input
-            logits_mask = logits[i, cols, :]
+            for local_i, i in enumerate(range(b_start, b_stop)):
+                cols = mask_col[mask_row == i]
+                if cols.size == 0:
+                    n_rep = mult_factor + int(i < remainder)
+                    start = i * mult_factor + min(i, remainder)
+                    stop = start + n_rep
+                    sampled_tokens[start:stop] = np.repeat(tokens_np[i:i + 1], n_rep, axis=0)
+                    sampled_data[start:stop] = data[i]
+                    continue
 
-            # mask out tokens according to the subword_mask
-            logits_mask[:, self.subwords_mask] = -np.inf
+                logits_mask = logits_batch[local_i, cols, :]
+                logits_mask[:, self.subwords_mask] = -np.inf
 
-            # select top n tokens from each distribution
-            top_n_eff = min(top_n, logits_mask.shape[1])
-            top_k_tokens = np.argpartition(logits_mask, -top_n_eff, axis=1)[:, -top_n_eff:]
-            top_k_logits = np.take_along_axis(logits_mask, top_k_tokens, axis=1)
-            top_k_logits = (top_k_logits / temperature) if use_proba else np.zeros_like(top_k_logits)
+                top_n_eff = min(top_n, logits_mask.shape[1])
+                top_k_tokens = np.argpartition(logits_mask, -top_n_eff, axis=1)[:, -top_n_eff:]
+                top_k_logits = np.take_along_axis(logits_mask, top_k_tokens, axis=1)
+                top_k_logits = (top_k_logits / temperature) if use_proba else np.zeros_like(top_k_logits)
 
-            # sample `num_samples` instances for the current mask template
-            n_rep = mult_factor + int(i < remainder)
-            start = i * mult_factor + min(i, remainder)
-            stop = start + n_rep
+                n_rep = mult_factor + int(i < remainder)
+                start = i * mult_factor + min(i, remainder)
+                stop = start + n_rep
+                sampled_tokens[start:stop] = np.repeat(tokens_np[i:i + 1], n_rep, axis=0)
 
-            sampled_tokens[start:stop] = np.repeat(tokens_np[i:i + 1], n_rep, axis=0)
+                n_masks = int(top_k_logits.shape[0])
+                tiled_logits = np.repeat(top_k_logits, repeats=n_rep, axis=0)
+                probs = np.exp(tiled_logits - tiled_logits.max(axis=1, keepdims=True))
+                probs /= probs.sum(axis=1, keepdims=True)
+                ids_k = np.array([
+                    self.rng.choice(probs.shape[1], p=probs[row])
+                    for row in range(probs.shape[0])
+                ], dtype=np.int64).reshape(n_rep, n_masks)
+                sampled_tokens[start:stop, cols] = np.take_along_axis(top_k_tokens, ids_k, axis=1)
+                sampled_data[start:stop] = data[i]
 
-            n_masks = int(top_k_logits.shape[0])
-            tiled_logits = np.repeat(top_k_logits, repeats=n_rep, axis=0)
-            probs = np.exp(tiled_logits - tiled_logits.max(axis=1, keepdims=True))
-            probs /= probs.sum(axis=1, keepdims=True)
-            ids_k = np.array([self.rng.choice(probs.shape[1], p=probs[row]) for row in range(probs.shape[0])], dtype=np.int64).reshape(n_rep, n_masks)
-            sampled_tokens[start:stop, cols] = np.take_along_axis(top_k_tokens, ids_k, axis=1)
+            del logits_batch
 
-            # Add the original binary mask which marks the beginning of a masked
-            # word, as is needed for the anchor algorithm (backend stuff)
-            sampled_data[start:stop] = data[i]
-
-        # Check that there are not masked tokens left
         assert np.all(sampled_tokens != self.model.mask_id)
         assert np.all(np.any(sampled_tokens != 0, axis=1))
         return sampled_tokens, sampled_data

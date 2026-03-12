@@ -59,6 +59,7 @@ class LanguageModel(abc.ABC):
         """
         self.model_path = model_path
         self.backend = backend.strip().lower()
+        self.device = None
         if self.backend not in ('tensorflow', 'pytorch'):
             raise ValueError("`backend` must be either 'tensorflow' or 'pytorch'.")
 
@@ -76,6 +77,13 @@ class LanguageModel(abc.ABC):
                     raise ImportError('AutoModelForMaskedLM is not available. Install torch-enabled transformers.')
                 self.model = pt_model_cls.from_pretrained(model_path)
                 self.model.eval()
+                if torch.cuda.is_available():
+                    self.device = torch.device('cuda')
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    self.device = torch.device('mps')
+                else:
+                    self.device = torch.device('cpu')
+                self.model.to(self.device)
                 self.caller = self.model
 
             # set tokenizer
@@ -103,6 +111,13 @@ class LanguageModel(abc.ABC):
                 raise ImportError('AutoModelForMaskedLM is not available. Install torch-enabled transformers.')
             self.model = pt_model_cls.from_pretrained(path, local_files_only=True)
             self.model.eval()
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+            else:
+                self.device = torch.device('cpu')
+            self.model.to(self.device)
             self.caller = self.model
 
         # set tokenizer
@@ -360,8 +375,8 @@ class LanguageModel(abc.ABC):
             if self.backend == 'tensorflow':
                 y[istart:istop] = self.caller(**x_batch).logits.numpy()
             else:
-                with torch.no_grad():
-                    pt_batch = {k: torch.as_tensor(v) for k, v in x_batch.items()}
+                with torch.inference_mode():
+                    pt_batch = {k: torch.as_tensor(v, device=self.device) for k, v in x_batch.items()}
                     logits = self.caller(**pt_batch).logits
                     y[istart:istop] = logits.detach().cpu().numpy()
         return y
