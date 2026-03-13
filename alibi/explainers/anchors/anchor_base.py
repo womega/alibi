@@ -96,10 +96,6 @@ class AnchorBaseBeam:
         # extended to accommodate an additional sample_cache_size batches.
         self.margin = kwargs.get('cache_margin', 1000)
         self.max_perturbation_batch_size = int(kwargs.get('max_perturbation_batch_size', 0) or 0)
-        self.max_total_samples = kwargs.get('max_total_samples', None)
-        self.max_model_calls = kwargs.get('max_model_calls', None)
-        self.adaptive_budget = bool(kwargs.get('adaptive_budget', False))
-        self.memory_saver_mode = bool(kwargs.get('memory_saver_mode', False))
         self.stats_provider = kwargs.get('stats_provider', None)
         self.instrumentation: Dict[str, Union[int, float, bool]] = {
             'start_time': 0.0,
@@ -112,8 +108,6 @@ class AnchorBaseBeam:
             'predicted_samples_total': 0,
             'sample_calls': 0,
             'samples_drawn': 0,
-            'max_total_samples_hit': False,
-            'max_model_calls_hit': False,
             'cached_state_data_bytes': 0,
             'cached_state_labels_bytes': 0,
             'cached_state_shapes': {},
@@ -155,13 +149,6 @@ class AnchorBaseBeam:
         self.instrumentation['predictor_invocations'] = model_calls
         self.instrumentation['predicted_samples_total'] = perturbation_samples
 
-    def _budget_exhausted(self) -> bool:
-        samples_hit = self.max_total_samples is not None and self.instrumentation['samples_drawn'] >= self.max_total_samples
-        calls_hit = self.max_model_calls is not None and self.instrumentation['model_calls'] >= self.max_model_calls
-        self.instrumentation['max_total_samples_hit'] = bool(samples_hit)
-        self.instrumentation['max_model_calls_hit'] = bool(calls_hit)
-        return bool(samples_hit or calls_hit)
-
     def _init_state(self, batch_size: int, coverage_data: np.ndarray) -> None:
         """
         Initialises the object state, which is used to compute result precisions & precision bounds
@@ -194,10 +181,6 @@ class AnchorBaseBeam:
             'n_features': coverage_data.shape[1],  # data set dim after encoding
             'coverage_data': coverage_data,  # coverage data
         }
-        if self.memory_saver_mode:
-            self.state['prealloc_size'] = 0
-            self.state['data'] = np.zeros((0, coverage_data.shape[1]), dtype=np.uint8)
-            self.state['labels'] = np.zeros((0,), dtype=np.uint8)
         self.state['t_order'][()] = ()  # Trivial order for the empty result
 
     @staticmethod
@@ -444,8 +427,6 @@ class AnchorBaseBeam:
         verbose_count = 0
 
         while B > epsilon:
-            if self._budget_exhausted():
-                break
 
             verbose_count += 1
             if verbose and verbose_count % verbose_every == 0:
@@ -496,8 +477,6 @@ class AnchorBaseBeam:
             anchor_pos = 0
             anchor_total = 0
             while anchor_total < target_batch_size:
-                if self._budget_exhausted():
-                    break
                 max_chunk = self.max_perturbation_batch_size or target_batch_size
                 n_chunk = min(max_chunk, target_batch_size - anchor_total)
                 samples = self.sample_fcn((i, tuple(self.state['t_order'][anchor])), num_samples=n_chunk)
@@ -508,11 +487,7 @@ class AnchorBaseBeam:
                 self.instrumentation['sample_calls'] += 1
                 self.instrumentation['samples_drawn'] += int(t)
                 self._refresh_sampler_counters()
-
-            if anchor_total == 0:
-                sample_stats.append((0, 1))
-            else:
-                sample_stats.append((anchor_pos, anchor_total))
+            sample_stats.append((anchor_pos, anchor_total))
 
         pos, total = list(zip(*sample_stats)) if sample_stats else (tuple(), tuple())
         return pos, total
@@ -534,18 +509,17 @@ class AnchorBaseBeam:
         all_features = range(state['n_features'])
         coverage_data = state['coverage_data']
         current_idx = state['current_idx']
-        data = state['data'][:current_idx] if not self.memory_saver_mode else None
-        labels = state['labels'][:current_idx] if not self.memory_saver_mode else None
+        data = state['data'][:current_idx]
+        labels = state['labels'][:current_idx]
 
         # initially, every feature separately is an result
         if len(previous_best) == 0:
             tuples = [(x,) for x in all_features]
             for x in tuples:
-                if not self.memory_saver_mode:
-                    pres = data[:, x[0]].nonzero()[0]  # Select samples whose feat value is = to the result value
-                    state['t_idx'][x] = set(pres)
-                    state['t_nsamples'][x] = float(len(pres))
-                    state['t_positives'][x] = float(labels[pres].sum())
+                pres = data[:, x[0]].nonzero()[0]  # Select samples whose feat value is = to the result value
+                state['t_idx'][x] = set(pres)
+                state['t_nsamples'][x] = float(len(pres))
+                state['t_positives'][x] = float(labels[pres].sum())
                 state['t_order'][x].append(x[0])
                 state['t_coverage_idx'][x] = set(coverage_data[:, x[0]].nonzero()[0])
                 state['t_coverage'][x] = (float(len(state['t_coverage_idx'][x])) / coverage_data.shape[0])
@@ -566,14 +540,13 @@ class AnchorBaseBeam:
                         state['t_coverage_idx'][(f,)])
                     )
                     state['t_coverage'][new_t] = (float(len(state['t_coverage_idx'][new_t])) / coverage_data.shape[0])
-                    if not self.memory_saver_mode:
-                        t_idx = np.array(list(state['t_idx'][t]))  # indices of samples where the len-1 result applies
-                        t_data = state['data'][t_idx]
-                        present = np.where(t_data[:, f] == 1)[0]
-                        state['t_idx'][new_t] = set(t_idx[present])  # indices of samples where the proposed result applies
-                        idx_list = list(state['t_idx'][new_t])
-                        state['t_nsamples'][new_t] = float(len(idx_list))
-                        state['t_positives'][new_t] = np.sum(state['labels'][idx_list])
+                    t_idx = np.array(list(state['t_idx'][t]))  # indices of samples where the len-1 result applies
+                    t_data = state['data'][t_idx]
+                    present = np.where(t_data[:, f] == 1)[0]
+                    state['t_idx'][new_t] = set(t_idx[present])  # indices of samples where the proposed result applies
+                    idx_list = list(state['t_idx'][new_t])
+                    state['t_nsamples'][new_t] = float(len(idx_list))
+                    state['t_positives'][new_t] = np.sum(state['labels'][idx_list])
 
         return list(new_tuples)
 
@@ -611,18 +584,16 @@ class AnchorBaseBeam:
 
         current_idx = self.state['current_idx']
         idxs = range(current_idx, current_idx + n_samples)
-        if not self.memory_saver_mode:
-            self.state['t_idx'][anchor].update(idxs)
+        self.state['t_idx'][anchor].update(idxs)
         self.state['t_nsamples'][anchor] += n_samples
         self.state['t_positives'][anchor] += labels.sum()
         self.state['t_covered_true'][anchor] = covered_true
         self.state['t_covered_false'][anchor] = covered_false
-        if not self.memory_saver_mode:
-            self.state['data'][idxs] = data
-            self.state['labels'][idxs] = labels
+        self.state['data'][idxs] = data
+        self.state['labels'][idxs] = labels
         self.state['current_idx'] += n_samples
 
-        if (not self.memory_saver_mode) and self.state['current_idx'] >= self.state['data'].shape[0] - max(self.margin, n_samples):
+        if self.state['current_idx'] >= self.state['data'].shape[0] - max(self.margin, n_samples):
             prealloc_size = self.state['prealloc_size']
             self.state['data'] = np.vstack(
                 (self.state['data'], np.zeros((prealloc_size, data.shape[1]), data.dtype))
@@ -762,22 +733,6 @@ class AnchorBaseBeam:
 
         return ((means >= desired_confidence) & (lbs < desired_confidence - epsilon_stop)) | \
                ((means < desired_confidence) & (ubs >= desired_confidence + epsilon_stop))
-
-
-    @staticmethod
-    def adaptive_batch_size(means: np.ndarray, lbs: np.ndarray, ubs: np.ndarray,
-                            desired_confidence: float, base_batch_size: int,
-                            min_batch_size: int = 8) -> int:
-        # Pick a larger batch when candidates are close to threshold and smaller otherwise.
-        if means.size == 0:
-            return base_batch_size
-        dist = np.minimum(np.abs(means - desired_confidence), np.minimum(np.abs(lbs - desired_confidence), np.abs(ubs - desired_confidence)))
-        d = float(np.mean(dist))
-        if d < 0.02:
-            return base_batch_size
-        if d < 0.05:
-            return max(min_batch_size, base_batch_size // 2)
-        return max(min_batch_size, base_batch_size // 4)
 
     def anchor_beam(self, delta: float = 0.05, epsilon: float = 0.1, desired_confidence: float = 1.,
                     beam_size: int = 1, epsilon_stop: float = 0.05, min_samples_start: int = 100,
@@ -924,8 +879,6 @@ class AnchorBaseBeam:
 
         # find best result using beam search
         while current_size <= max_anchor_size:
-            if self._budget_exhausted():
-                break
 
             # create new candidate anchors by adding features to current best anchors
             anchors = self.propose_anchors(best_of_size[current_size - 1])
@@ -969,20 +922,8 @@ class AnchorBaseBeam:
             # draw samples to ensure result meets precision criteria
             continue_sampling = self.to_sample(means, ubs, lbs, desired_confidence, epsilon_stop)
             while continue_sampling.any():
-                if self._budget_exhausted():
-                    break
-                selected_idx = candidate_anchors[continue_sampling]
-                selected_anchors = [anchors[idx] for idx in selected_idx]
-                eff_batch_size = batch_size
-                if self.adaptive_budget:
-                    eff_batch_size = self.adaptive_batch_size(
-                        means[continue_sampling],
-                        lbs[continue_sampling],
-                        ubs[continue_sampling],
-                        desired_confidence,
-                        batch_size,
-                    )
-                pos, total = self.draw_samples(selected_anchors, eff_batch_size)
+                selected_anchors = [anchors[idx] for idx in candidate_anchors[continue_sampling]]
+                pos, total = self.draw_samples(selected_anchors, batch_size)
                 positives[continue_sampling] += pos
                 n_samples[continue_sampling] += total
                 means[continue_sampling] = positives[continue_sampling] / n_samples[continue_sampling]
