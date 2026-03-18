@@ -115,15 +115,16 @@ class LanguageModelSampler(AnchorTextSampler):
         )
 
         # lambda expressions to check for a subword
-        subword_cond = lambda token, idx: self.model.is_subword_prefix(
-            token
-        )  # noqa: E731
+        def subword_cond(token, idx):
+            return self.model.is_subword_prefix(token)
+
         # lambda experssion to check for a stopword
-        stopwords_cond = lambda token, idx: is_stop_word(start_idx=idx)  # noqa: E731
+        def stopwords_cond(token, idx):
+            return is_stop_word(start_idx=idx)
+
         # lambda expression to check for punctuation
-        punctuation_cond = lambda token, idx: self.model.is_punctuation(
-            token, punctuation
-        )  # noqa: E731
+        def punctuation_cond(token, idx):
+            return self.model.is_punctuation(token, punctuation)
 
         # Gather all in a list of conditions
         conds = [punctuation_cond, stopwords_cond, subword_cond]
