@@ -51,10 +51,14 @@ class TabularSampler:
             If set, fixes the random number sequence.
         """
 
-        np.random.seed(seed)
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
 
         self.predictor = predictor
         self.n_covered_ex = n_covered_ex
+        self.max_perturbation_batch_size: Optional[int] = None
+        self.model_calls: int = 0
+        self.perturbation_samples_evaluated: int = 0
 
         self.numerical_features = numerical_features
         self.disc_perc = disc_perc
@@ -133,6 +137,8 @@ class TabularSampler:
         """
 
         label: int = self.predictor(X.reshape(1, -1))[0]
+        self.model_calls += 1
+        self.perturbation_samples_evaluated += 1
         self.instance_label = label
 
     def set_n_covered(self, n_covered: int) -> None:
@@ -148,6 +154,15 @@ class TabularSampler:
         """
 
         self.n_covered_ex = n_covered
+
+    def set_max_perturbation_batch_size(self, max_perturbation_batch_size: Optional[int]) -> None:
+        """Configure max predictor batch size used when evaluating perturbations."""
+        self.max_perturbation_batch_size = max_perturbation_batch_size
+
+    def reset_stats(self) -> None:
+        """Reset per-explanation counters used for instrumentation."""
+        self.model_calls = 0
+        self.perturbation_samples_evaluated = 0
 
     def _get_data_index(self) -> Dict[int, DefaultDict[int, np.ndarray]]:
         """
@@ -212,7 +227,7 @@ class TabularSampler:
 
         # use the sampled, discretized raw data to construct a data matrix with the categorical ...
         # ... and binned ordinal data (1 if in bin, 0 otherwise)
-        data = np.zeros((num_samples, len(self.enc2feat_idx)), int)
+        data = np.zeros((num_samples, len(self.enc2feat_idx)), dtype=np.uint8)
         for i in self.enc2feat_idx:
             if i in self.cat_lookup:
                 data[:, i] = (d_raw_data[:, self.enc2feat_idx[i]] == self.cat_lookup[i])
@@ -226,7 +241,7 @@ class TabularSampler:
             labels = self.compare_labels(raw_data)
             covered_true = raw_data[labels, :][:self.n_covered_ex]
             covered_false = raw_data[np.logical_not(labels), :][:self.n_covered_ex]
-            return [covered_true, covered_false, labels.astype(int), data, coverage,
+            return [covered_true, covered_false, labels.astype(np.uint8), data, coverage,
                     anchor[0]]  # type: ignore[return-value]
         else:
             return [data]  # only binarised data is used for coverage computation
@@ -246,7 +261,15 @@ class TabularSampler:
         An array of integers indicating whether the prediction was the same as the instance label.
         """
 
-        return self.predictor(samples) == self.instance_label
+        max_batch = self.max_perturbation_batch_size or samples.shape[0]
+        labels = np.empty(samples.shape[0], dtype=bool)
+        for start in range(0, samples.shape[0], max_batch):
+            stop = min(start + max_batch, samples.shape[0])
+            preds = self.predictor(samples[start:stop])
+            self.model_calls += 1
+            self.perturbation_samples_evaluated += (stop - start)
+            labels[start:stop] = (preds == self.instance_label)
+        return labels
 
     def perturbation(self, anchor: tuple, num_samples: int) -> Tuple[np.ndarray, np.ndarray, float]:
         """
@@ -271,7 +294,7 @@ class TabularSampler:
         """
 
         # initialise samples randomly
-        init_sample_idx = np.random.choice(range(self.train_data.shape[0]), num_samples, replace=True)
+        init_sample_idx = self.rng.choice(self.train_data.shape[0], num_samples, replace=True)
         samples = self.train_data[init_sample_idx]
         d_samples = self.d_train_data[init_sample_idx]
 
@@ -301,7 +324,7 @@ class TabularSampler:
         # if there are enough train records containing the anchor, replace the original records and return...
         num_samples_pos = np.searchsorted(nb_partial_anchors, num_samples)
         if num_samples_pos == 0:
-            samples_idxs = np.random.choice(partial_anchor_rows[-1], num_samples)
+            samples_idxs = self.rng.choice(partial_anchor_rows[-1], num_samples)
             samples[:, uniq_feat_ids] = self.train_data[np.ix_(samples_idxs, uniq_feat_ids)]  # type: ignore[arg-type]
             d_samples[:, uniq_feat_ids] = self.d_train_data[
                 np.ix_(samples_idxs, uniq_feat_ids)]  # type: ignore[arg-type]
@@ -355,7 +378,7 @@ class TabularSampler:
                       " Sampling uniformly at random from the feature range!"
                 print(fmt.format(feat, allowed_bins[feat]))
                 min_vals, max_vals = self.min[feat], self.max[feat]
-                samples[:, feat] = np.random.uniform(low=min_vals, high=max_vals, size=(num_samples,))
+                samples[:, feat] = self.rng.uniform(low=min_vals, high=max_vals, size=(num_samples,))
 
     def replace_features(self, samples: np.ndarray, allowed_rows: Dict[int, Any], uniq_feat_ids: List[int],
                          partial_anchor_rows: List[np.ndarray], nb_partial_anchors: np.ndarray,
@@ -405,9 +428,9 @@ class TabularSampler:
                 num_samples -= n_samp
             else:
                 if num_samples <= partial_anchor_rows[n_anchor_feats - idx - 1].shape[0]:
-                    samp_idxs = np.random.choice(partial_anchor_rows[n_anchor_feats - idx - 1], num_samples)
+                    samp_idxs = self.rng.choice(partial_anchor_rows[n_anchor_feats - idx - 1], num_samples)
                 else:
-                    samp_idxs = np.random.choice(
+                    samp_idxs = self.rng.choice(
                         partial_anchor_rows[n_anchor_feats - idx - 1],
                         num_samples,
                         replace=True,
@@ -423,7 +446,7 @@ class TabularSampler:
                 feats_to_replace = uniq_feat_ids[:idx]
                 samp_idxs = np.zeros((len(feats_to_replace), n_samp)).astype(int)  # =: P x Q
                 for i, feat_idx in enumerate(feats_to_replace):
-                    samp_idxs[i, :] = np.random.choice(allowed_rows[feat_idx], n_samp, replace=True)
+                    samp_idxs[i, :] = self.rng.choice(allowed_rows[feat_idx], n_samp, replace=True)
 
                 # N x F ->  P X Q x F -> P X Q
                 # First slice takes the data rows indicated in rows of samp_idxs; each row corresponds to a diff. feat
@@ -441,7 +464,7 @@ class TabularSampler:
 
             samp_idxs = np.zeros((len(uniq_feat_ids), n_samp)).astype(int)
             for i, feat_idx in enumerate(uniq_feat_ids):
-                samp_idxs[i, :] = np.random.choice(allowed_rows[feat_idx], n_samp, replace=True)
+                samp_idxs[i, :] = self.rng.choice(allowed_rows[feat_idx], n_samp, replace=True)
 
             to_replace_vals = self.train_data[samp_idxs][np.arange(len(uniq_feat_ids)), :, uniq_feat_ids]
             samples[start:, uniq_feat_ids] = to_replace_vals.transpose()
@@ -824,9 +847,12 @@ class AnchorTabular(Explainer, FitMixin):
         for key in remove:
             params.pop(key)
 
+        max_perturbation_batch_size = kwargs.get('max_perturbation_batch_size')
         for sampler in self.samplers:
-            sampler.set_instance_label(X)
+            sampler.reset_stats()
             sampler.set_n_covered(n_covered_ex)
+            sampler.set_max_perturbation_batch_size(max_perturbation_batch_size)
+            sampler.set_instance_label(X)
         self.instance_label = self.samplers[0].instance_label
 
         # build feature encoding and mappings from the instance values to database rows where

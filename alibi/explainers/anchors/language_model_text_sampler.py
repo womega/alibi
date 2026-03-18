@@ -1,10 +1,10 @@
 import string
 from functools import partial
 
-from typing import (Dict, List, Optional, Tuple)
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorflow as tf
+import time
 
 from alibi.utils.lang_model import LanguageModel
 from alibi.explainers.anchors.text_samplers import AnchorTextSampler
@@ -12,10 +12,16 @@ from alibi.explainers.anchors.text_samplers import AnchorTextSampler
 
 class LanguageModelSampler(AnchorTextSampler):
     # filling procedures
-    FILLING_PARALLEL: str = 'parallel'  #: Parallel filling procedure.
-    FILLING_AUTOREGRESSIVE = 'autoregressive'  #: Autoregressive filling procedure. Considerably slow.
+    FILLING_PARALLEL: str = "parallel"  #: Parallel filling procedure.
+    FILLING_AUTOREGRESSIVE = (
+        "autoregressive"  #: Autoregressive filling procedure. Considerably slow.
+    )
 
-    def __init__(self, model: LanguageModel, perturb_opts: dict, ):
+    def __init__(
+        self,
+        model: LanguageModel,
+        perturb_opts: dict,
+    ):
         """
         Initialize language model sampler. This sampler replaces words with the ones
         sampled according to the output distribution of the language model. There are
@@ -53,22 +59,34 @@ class LanguageModelSampler(AnchorTextSampler):
 
             # Add punctuation in the sampling mask. This means that the
             # punctuation will not be considered when sampling for the masked words.
-            sample_punctuation: bool = perturb_opts.get('sample_punctuation', False)
-            punctuation: str = perturb_opts.get('punctuation', string.punctuation)
+            sample_punctuation: bool = perturb_opts.get("sample_punctuation", False)
+            punctuation: str = perturb_opts.get("punctuation", string.punctuation)
 
-            if (not sample_punctuation) and self.model.is_punctuation(token, punctuation):
+            if (not sample_punctuation) and self.model.is_punctuation(
+                token, punctuation
+            ):
                 self.subwords_mask[vocab[token]] = True
 
         # define head, tail part of the text
-        self.head: str = ''
-        self.tail: str = ''
+        self.head: str = ""
+        self.tail: str = ""
         self.head_tokens: List[str] = []
         self.tail_tokens: List[str] = []
+        self.timing = {
+            "perturbation_generation_s": 0.0,
+            "lm_sampling_s": 0.0,
+            "conversion_s": 0.0,
+            "tokenizer_calls": 0,
+            "lm_forward_calls": 0,
+            "mask_fill_calls": 0,
+        }
 
-    def get_sample_ids(self,
-                       punctuation: str = string.punctuation,
-                       stopwords: Optional[List[str]] = None,
-                       **kwargs) -> None:
+    def get_sample_ids(
+        self,
+        punctuation: str = string.punctuation,
+        stopwords: Optional[List[str]] = None,
+        **kwargs,
+    ) -> None:
         """
         Find indices in words which can be perturbed.
 
@@ -93,15 +111,20 @@ class LanguageModelSampler(AnchorTextSampler):
             self.model.is_stop_word,
             tokenized_text=self.head_tokens,
             punctuation=punctuation,
-            stopwords=stopwords
+            stopwords=stopwords,
         )
 
         # lambda expressions to check for a subword
-        subword_cond = lambda token, idx: self.model.is_subword_prefix(token)  # noqa: E731
+        def subword_cond(token, idx):
+            return self.model.is_subword_prefix(token)
+
         # lambda experssion to check for a stopword
-        stopwords_cond = lambda token, idx: is_stop_word(start_idx=idx)  # noqa: E731
+        def stopwords_cond(token, idx):
+            return is_stop_word(start_idx=idx)
+
         # lambda expression to check for punctuation
-        punctuation_cond = lambda token, idx: self.model.is_punctuation(token, punctuation)  # noqa: E731
+        def punctuation_cond(token, idx):
+            return self.model.is_punctuation(token, punctuation)
 
         # Gather all in a list of conditions
         conds = [punctuation_cond, stopwords_cond, subword_cond]
@@ -130,7 +153,9 @@ class LanguageModelSampler(AnchorTextSampler):
         """
         # Some language models can only work with a limited number of tokens. Thus the text needs
         # to be split in head_text and tail_text. We will only alter the head_tokens.
-        self.head, self.tail, self.head_tokens, self.tail_tokens = self.model.head_tail_split(text)
+        self.head, self.tail, self.head_tokens, self.tail_tokens = (
+            self.model.head_tail_split(text)
+        )
 
         # define indices of the words which can be perturbed
         self.get_sample_ids(**self.perturb_opts)
@@ -138,7 +163,9 @@ class LanguageModelSampler(AnchorTextSampler):
         # Set dtypes
         self.set_data_type()
 
-    def __call__(self, anchor: tuple, num_samples: int) -> Tuple[np.ndarray, np.ndarray]:
+    def __call__(
+        self, anchor: tuple, num_samples: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         The function returns a `numpy` array of `num_samples` where randomly chosen features,
         except those in anchor, are replaced by words sampled according to the language
@@ -158,14 +185,16 @@ class LanguageModelSampler(AnchorTextSampler):
         assert self.perturb_opts, "Perturbation options are not set."
         return self.perturb_sentence(anchor, num_samples, **self.perturb_opts)
 
-    def perturb_sentence(self,
-                         anchor: tuple,
-                         num_samples: int,
-                         sample_proba: float = .5,
-                         top_n: int = 100,
-                         batch_size_lm: int = 32,
-                         filling: str = "parallel",
-                         **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    def perturb_sentence(
+        self,
+        anchor: tuple,
+        num_samples: int,
+        sample_proba: float = 0.5,
+        top_n: int = 100,
+        batch_size_lm: int = 32,
+        filling: str = "parallel",
+        **kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         The function returns an `numpy` array of `num_samples` where randomly chosen features,
         except those in anchor, are replaced by words sampled according to the language
@@ -202,32 +231,35 @@ class LanguageModelSampler(AnchorTextSampler):
             num_samples=num_samples,
             sample_proba=sample_proba,
             filling=filling,
-            **kwargs
+            **kwargs,
         )
 
         # If the anchor does not cover the entire sentence,
         # then fill in mask with language model
         if len(anchor) != len(self.ids_sample):
             raw, data = self.fill_mask(
-                raw=raw, data=data,
+                raw=raw,
+                data=data,
                 num_samples=num_samples,
                 top_n=top_n,
                 batch_size_lm=batch_size_lm,
                 filling=filling,
-                **kwargs
+                **kwargs,
             )
 
         # append tail if it exits
         raw = self._append_tail(raw) if self.tail else raw
         return raw, data
 
-    def create_mask(self,
-                    anchor: tuple,
-                    num_samples: int,
-                    sample_proba: float = 1.0,
-                    filling: str = 'parallel',
-                    frac_mask_templates: float = 0.1,
-                    **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    def create_mask(
+        self,
+        anchor: tuple,
+        num_samples: int,
+        sample_proba: float = 1.0,
+        filling: str = "parallel",
+        frac_mask_templates: float = 0.1,
+        **kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Create mask for words to be perturbed.
 
@@ -254,6 +286,7 @@ class LanguageModelSampler(AnchorTextSampler):
             A `(num_samples, m)`-dimensional boolean array, where `m` is the number of tokens
             in the instance to be explained.
         """
+        t0 = time.perf_counter()
         # make sure that frac_mask_templates is in [0, 1]
         frac_mask_templates = np.clip(frac_mask_templates, 0, 1).item()
 
@@ -272,7 +305,11 @@ class LanguageModelSampler(AnchorTextSampler):
             # Thus there is no point in generating more than one mask.
             # Otherwise compute the number of masking templates according to the fraction
             # passed as argument and make sure that at least one mask template is generated
-            mask_templates = 1 if np.isclose(sample_proba, 1) else max(1, int(num_samples * frac_mask_templates))
+            mask_templates = (
+                1
+                if np.isclose(sample_proba, 1)
+                else max(1, int(num_samples * frac_mask_templates))
+            )
 
         # allocate memory
         data = np.ones((mask_templates, len(self.ids_sample)), dtype=np.int32)
@@ -289,8 +326,10 @@ class LanguageModelSampler(AnchorTextSampler):
                 # is much easier to ensure that at least one word in the sentence is masked.
                 # If the sampling is performed over the columns it might be the case
                 # that no word in a sentence will be masked.
-                n_changed = max(1, np.random.binomial(len(allowed_indices), sample_proba))
-                changed = np.random.choice(allowed_indices, n_changed, replace=False)
+                n_changed = max(
+                    1, self.rng.binomial(len(allowed_indices), sample_proba)
+                )
+                changed = self.rng.choice(allowed_indices, n_changed, replace=False)
 
                 # mark the entrance as maks
                 data[i, changed] = 0
@@ -305,7 +344,12 @@ class LanguageModelSampler(AnchorTextSampler):
                     self._remove_subwords(raw=raw, row=i, col=j, **kwargs)
 
         # join words
-        raw = np.apply_along_axis(self._joiner, axis=1, arr=raw, dtype=self.dtype_sent)
+        raw = np.fromiter(
+            (self._joiner(row, self.dtype_sent).item() for row in raw),
+            dtype=self.dtype_sent,
+            count=raw.shape[0],
+        )
+        self.timing["perturbation_generation_s"] += time.perf_counter() - t0
         return raw, data
 
     def _append_tail(self, raw: np.ndarray) -> np.ndarray:
@@ -355,14 +399,16 @@ class LanguageModelSampler(AnchorTextSampler):
 
         return np.array(str_arr).astype(dtype)
 
-    def fill_mask(self,
-                  raw: np.ndarray,
-                  data: np.ndarray,
-                  num_samples: int,
-                  top_n: int = 100,
-                  batch_size_lm: int = 32,
-                  filling: str = "parallel",
-                  **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    def fill_mask(
+        self,
+        raw: np.ndarray,
+        data: np.ndarray,
+        num_samples: int,
+        top_n: int = 100,
+        batch_size_lm: int = 32,
+        filling: str = "parallel",
+        **kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Fill in the masked tokens with language model.
 
@@ -388,21 +434,36 @@ class LanguageModelSampler(AnchorTextSampler):
         raw
             Array containing `num_samples` elements. Each element is a perturbed sentence.
         """
+        t0 = time.perf_counter()
         # chose the perturbation function
-        perturb_func = self._perturb_instances_parallel if filling == self.FILLING_PARALLEL \
+        perturb_func = (
+            self._perturb_instances_parallel
+            if filling == self.FILLING_PARALLEL
             else self._perturb_instance_ar
+        )
 
         # perturb instances
-        tokens, data = perturb_func(raw=raw, data=data,
-                                    num_samples=num_samples,
-                                    batch_size_lm=batch_size_lm,
-                                    top_n=top_n, **kwargs)
+        tokens, data = perturb_func(
+            raw=raw,
+            data=data,
+            num_samples=num_samples,
+            batch_size_lm=batch_size_lm,
+            top_n=top_n,
+            **kwargs,
+        )
 
         # decode the tokens and remove special characters as <pad>, <cls> etc.
+        t1 = time.perf_counter()
+        self.timing["conversion_s"] += t1 - t0
+        self.timing["tokenizer_calls"] += 1
         raw = self.model.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+        self.timing["lm_sampling_s"] += time.perf_counter() - t0
+        self.timing["mask_fill_calls"] += 1
         return np.array(raw), data
 
-    def _remove_subwords(self, raw: np.ndarray, row: int, col: int, punctuation: str = '', **kwargs) -> np.ndarray:
+    def _remove_subwords(
+        self, raw: np.ndarray, row: int, col: int, punctuation: str = "", **kwargs
+    ) -> np.ndarray:
         """
         Deletes the subwords that follow a given token identified by the `(row, col)` pair in the `raw` matrix.
         A token is considered to be part of a word if is not a punctuation and if has the subword prefix
@@ -432,121 +493,123 @@ class LanguageModelSampler(AnchorTextSampler):
 
             # if it is a subword prefix, then replace it by empty string
             if self.model.is_subword_prefix(raw[row, next_col]):
-                raw[row, next_col] = ''
+                raw[row, next_col] = ""
             else:
                 break
 
         return raw
 
-    def _perturb_instances_parallel(self,
-                                    num_samples: int,
-                                    raw: np.ndarray,
-                                    data: np.ndarray,
-                                    top_n: int = 100,
-                                    batch_size_lm: int = 32,
-                                    temperature: float = 1.0,
-                                    use_proba: bool = False,
-                                    **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    def _perturb_instances_parallel(
+        self,
+        num_samples: int,
+        raw: np.ndarray,
+        data: np.ndarray,
+        top_n: int = 100,
+        batch_size_lm: int = 32,
+        temperature: float = 1.0,
+        use_proba: bool = False,
+        **kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Perturb the instances in a single forward pass (parallel).
-
-        Parameters
-        ----------
-        num_samples
-            Number of samples to be generated
-        raw
-            Array of mask templates. Has `mask_templates` rows.
-        data
-            Binary array having 0 where the tokens are masked. Has `mask_templates` rows.
-        top_n:
-            Use the top n words when sampling.
-        batch_size_lm:
-            Batch size used for language model.
-        temperature
-            Sample weight hyper-parameter.
-        use_proba
-            Bool whether to sample according to the predicted words distribution
-        **kwargs
-            Other arguments. Not used.
-
-        Returns
-        -------
-        sampled_tokens
-            Array containing the ids of the sampled tokens. Has `num_samples` rows.
-        sampled_data
-            Binary array having 0 where the tokens were masked. Has `num_samples` rows.
         """
-        # tokenize instances
-        tokens_plus = self.model.tokenizer.batch_encode_plus(list(raw), padding=True, return_tensors='tf')
+        tokens_plus = self.model.tokenizer.batch_encode_plus(
+            list(raw), padding=True, return_tensors="np"
+        )
 
-        # number of samples to generate per mask template
         remainder = num_samples % len(raw)
         mult_factor = num_samples // len(raw)
 
-        # fill in masks with language model
-        # (mask_template x max_length_sentence x num_tokens)
-        logits = self.model.predict_batch_lm(x=tokens_plus,
-                                             vocab_size=self.model.tokenizer.vocab_size,
-                                             batch_size=batch_size_lm)
-
-        # select rows and cols where the input the tokens are masked
-        tokens = tokens_plus['input_ids']  # (mask_template x max_length_sentence)
-        mask_pos = tf.where(tokens == self.model.mask_id)
+        tokens_np = tokens_plus["input_ids"]
+        mask_pos = np.argwhere(tokens_np == self.model.mask_id)
         mask_row, mask_col = mask_pos[:, 0], mask_pos[:, 1]
 
-        # buffer containing sampled tokens
-        sampled_tokens = np.zeros((num_samples, tokens.shape[1]), dtype=np.int32)
-        sampled_data = np.zeros((num_samples, data.shape[1]))
+        sampled_tokens = np.zeros((num_samples, tokens_np.shape[1]), dtype=np.int32)
+        sampled_data = np.zeros((num_samples, data.shape[1]), dtype=data.dtype)
 
-        for i in range(logits.shape[0]):
-            # select indices corresponding to the current row `i`
-            idx = tf.reshape(tf.where(mask_row == i), shape=-1)
+        n_templates = tokens_np.shape[0]
+        for b_start in range(0, n_templates, batch_size_lm):
+            b_stop = min(b_start + batch_size_lm, n_templates)
+            x_batch = {k: v[b_start:b_stop] for k, v in tokens_plus.items()}
+            logits_batch = self.model.predict_batch_lm(
+                x=x_batch,
+                vocab_size=self.model.tokenizer.vocab_size,
+                batch_size=batch_size_lm,
+            )
+            self.timing["lm_forward_calls"] += 1
 
-            # select columns corresponding to the current row `i`
-            cols = tf.gather(mask_col, idx)
+            for local_i, i in enumerate(range(b_start, b_stop)):
+                cols = mask_col[mask_row == i]
+                if cols.size == 0:
+                    n_rep = mult_factor + int(i < remainder)
+                    start = i * mult_factor + min(i, remainder)
+                    stop = start + n_rep
+                    sampled_tokens[start:stop] = np.repeat(
+                        tokens_np[i : i + 1], n_rep, axis=0
+                    )
+                    sampled_data[start:stop] = data[i]
+                    continue
 
-            # select the logits of the masked input
-            logits_mask = logits[i, cols, :]
+                logits_mask = logits_batch[local_i, cols, :]
+                logits_mask[:, self.subwords_mask] = -np.inf
 
-            # mask out tokens according to the subword_mask
-            logits_mask[:, self.subwords_mask] = -np.inf
+                top_n_eff = min(top_n, logits_mask.shape[1])
+                top_k_tokens = np.argpartition(logits_mask, -top_n_eff, axis=1)[
+                    :, -top_n_eff:
+                ]
+                top_k_logits = np.take_along_axis(logits_mask, top_k_tokens, axis=1)
+                top_k_logits = (
+                    (top_k_logits / temperature)
+                    if use_proba
+                    else np.zeros_like(top_k_logits)
+                )
 
-            # select top n tokens from each distribution
-            top_k = tf.math.top_k(logits_mask, top_n)
-            top_k_logits, top_k_tokens = top_k.values, top_k.indices
-            top_k_logits = (top_k_logits / temperature) if use_proba else (top_k_logits * 0)
+                n_rep = mult_factor + int(i < remainder)
+                start = i * mult_factor + min(i, remainder)
+                stop = start + n_rep
+                sampled_tokens[start:stop] = np.repeat(
+                    tokens_np[i : i + 1], n_rep, axis=0
+                )
 
-            # sample `num_samples` instance for the current mask template
-            for j in range(mult_factor + int(i < remainder)):
-                # Compute the buffer index
-                idx = i * mult_factor + j + min(i, remainder)
+                n_masks = int(top_k_logits.shape[0])
+                tiled_logits = np.repeat(top_k_logits, repeats=n_rep, axis=0)
+                probs = np.exp(tiled_logits - tiled_logits.max(axis=1, keepdims=True))
+                probs /= probs.sum(axis=1, keepdims=True)
+                ids_k = np.array(
+                    [
+                        self.rng.choice(probs.shape[1], p=probs[row])
+                        for row in range(probs.shape[0])
+                    ],
+                    dtype=np.int64,
+                ).reshape(n_rep, n_masks)
+                sampled_values = top_k_tokens[np.arange(n_masks)[None, :], ids_k]
+                if sampled_values.shape != (n_rep, n_masks):
+                    raise RuntimeError(
+                        "Anchors LM sampler shape mismatch before masked write: "
+                        f"sampled_values={sampled_values.shape}, expected={(n_rep, n_masks)}, "
+                        f"top_k_tokens={top_k_tokens.shape}, ids_k={ids_k.shape}, cols={cols.shape}, "
+                        f"num_samples={num_samples}, template_index={i}"
+                    )
+                sampled_tokens[start:stop, cols] = sampled_values
+                sampled_data[start:stop] = data[i]
 
-                # Sample indices
-                ids_k = tf.reshape(tf.random.categorical(top_k_logits, 1), shape=-1)
+            del logits_batch
 
-                # Set the unmasked tokens and for the masked one and replace them with the samples drawn
-                sampled_tokens[idx] = tokens[i]
-                sampled_tokens[idx, cols] = tf.gather(top_k_tokens, ids_k, batch_dims=1)
-
-            # Add the original binary mask which marks the beginning of a masked
-            # word, as is needed for the anchor algorithm (backend stuff)
-            idx, offset = i * mult_factor, min(i, remainder)
-            sampled_data[idx + offset:idx + mult_factor + offset + (i < remainder)] = data[i]
-
-        # Check that there are not masked tokens left
         assert np.all(sampled_tokens != self.model.mask_id)
         assert np.all(np.any(sampled_tokens != 0, axis=1))
         return sampled_tokens, sampled_data
 
-    def _perturb_instance_ar(self,
-                             num_samples: int,
-                             raw: np.ndarray,
-                             data: np.ndarray,
-                             top_n: int = 100,
-                             batch_size: int = 32,
-                             temperature: float = 1.0,
-                             use_proba: bool = False,
-                             **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    def _perturb_instance_ar(
+        self,
+        num_samples: int,
+        raw: np.ndarray,
+        data: np.ndarray,
+        top_n: int = 100,
+        batch_size: int = 32,
+        temperature: float = 1.0,
+        use_proba: bool = False,
+        **kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Perturb the instances in an autoregressive fashion (sequential).
 
@@ -580,19 +643,23 @@ class LanguageModelSampler(AnchorTextSampler):
         assert num_samples == raw.shape[0]
 
         # tokenize instances
-        tokens_plus = self.model.tokenizer.batch_encode_plus(list(raw), padding=True, return_tensors='tf')
-        tokens = tokens_plus['input_ids'].numpy()  # (mask_template x max_length_sentence)
+        tokens_plus = self.model.tokenizer.batch_encode_plus(
+            list(raw), padding=True, return_tensors="np"
+        )
+        tokens = tokens_plus[
+            "input_ids"
+        ].copy()  # (mask_template x max_length_sentence)
 
         # store the column indices for each row where a token is a mask
         masked_idx = []
         max_len_idx = -1
-        mask_pos = tf.where(tokens == self.model.mask_id)
+        mask_pos = np.argwhere(tokens == self.model.mask_id)
         mask_row, mask_col = mask_pos[:, 0], mask_pos[:, 1]
 
         for i in range(tokens.shape[0]):
             # get the columns indexes and store them in the buffer
-            idx = tf.reshape(tf.where(mask_row == i), shape=-1)
-            cols = tf.gather(mask_col, idx)
+            idx = np.where(mask_row == i)[0]
+            cols = mask_col[idx]
             masked_idx.append(cols)
 
             # update maximum length
@@ -612,9 +679,12 @@ class LanguageModelSampler(AnchorTextSampler):
                 masked_cols.append(masked_idx[row][i])
 
             # compute logits
-            logits = self.model.predict_batch_lm(x=tokens_plus,
-                                                 vocab_size=self.model.tokenizer.vocab_size,
-                                                 batch_size=batch_size)
+            logits = self.model.predict_batch_lm(
+                x=tokens_plus,
+                vocab_size=self.model.tokenizer.vocab_size,
+                batch_size=batch_size,
+            )
+            self.timing["lm_forward_calls"] += 1
 
             # select only the logits of the first masked word in each row
             logits_mask = logits[masked_rows, masked_cols, :]
@@ -623,16 +693,32 @@ class LanguageModelSampler(AnchorTextSampler):
             logits_mask[:, self.subwords_mask] = -np.inf
 
             # select top n tokens from each distribution
-            top_k = tf.math.top_k(logits_mask, top_n)
-            top_k_logits, top_k_tokens = top_k.values, top_k.indices
-            top_k_logits = (top_k_logits / temperature) if use_proba else (top_k_logits * 0)
+            top_n_eff = min(top_n, logits_mask.shape[1])
+            top_k_tokens = np.argpartition(logits_mask, -top_n_eff, axis=1)[
+                :, -top_n_eff:
+            ]
+            top_k_logits = np.take_along_axis(logits_mask, top_k_tokens, axis=1)
+            top_k_logits = (
+                (top_k_logits / temperature)
+                if use_proba
+                else np.zeros_like(top_k_logits)
+            )
 
-            # Sample indices
-            ids_k = tf.reshape(tf.random.categorical(top_k_logits, 1), shape=-1)
+            probs = np.exp(top_k_logits - top_k_logits.max(axis=1, keepdims=True))
+            probs /= probs.sum(axis=1, keepdims=True)
+            ids_k = np.array(
+                [
+                    self.rng.choice(probs.shape[1], p=probs[row])
+                    for row in range(probs.shape[0])
+                ],
+                dtype=np.int64,
+            )
 
             # replace masked tokens with the sampled one
-            tokens[masked_rows, masked_cols] = tf.gather(top_k_tokens, ids_k, batch_dims=1)
-            tokens_plus['input_ids'] = tf.convert_to_tensor(tokens)
+            tokens[masked_rows, masked_cols] = top_k_tokens[
+                np.arange(len(ids_k)), ids_k
+            ]
+            tokens_plus["input_ids"] = tokens
         return tokens, data
 
     def set_data_type(self) -> None:
@@ -660,8 +746,8 @@ class LanguageModelSampler(AnchorTextSampler):
         max_sent_len = (len(self.head_tokens) + len(self.tail_tokens)) * max_len
 
         # define the types to be used
-        self.dtype_token = '<U' + str(max_len)
-        self.dtype_sent = '<U' + str(max_sent_len)
+        self.dtype_token = "<U" + str(max_len)
+        self.dtype_sent = "<U" + str(max_sent_len)
 
     def seed(self, seed: int) -> None:
-        tf.random.set_seed(seed)
+        self.rng = np.random.default_rng(seed)

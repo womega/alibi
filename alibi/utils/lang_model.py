@@ -25,9 +25,13 @@ import numpy as np
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
-import tensorflow as tf
 import transformers
-from transformers import TFAutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoTokenizer
+
+from alibi.utils.missing_optional_dependency import import_optional
+
+tensorflow = import_optional('tensorflow')
+torch = import_optional('torch')
 
 
 class LanguageModel(abc.ABC):
@@ -41,7 +45,7 @@ class LanguageModel(abc.ABC):
     #  unsure if we can be more specific right now
     caller: Callable
 
-    def __init__(self, model_path: str, preloading: bool = True):
+    def __init__(self, model_path: str, preloading: bool = True, backend: str = 'tensorflow'):
         """
         Initialize the language model.
 
@@ -54,12 +58,33 @@ class LanguageModel(abc.ABC):
             method is expected.
         """
         self.model_path = model_path
+        self.backend = backend.strip().lower()
+        self.device = None
+        if self.backend not in ('tensorflow', 'pytorch'):
+            raise ValueError("`backend` must be either 'tensorflow' or 'pytorch'.")
 
         if preloading:
-            # set model (for performance reasons the `call` method is wrapped in tf.function)
-            self.model = TFAutoModelForMaskedLM.from_pretrained(model_path)
-
-            self.caller = tf.function(self.model.call, experimental_relax_shapes=True)
+            if self.backend == 'tensorflow':
+                # set model (for performance reasons the `call` method is wrapped in tf.function)
+                tf_model_cls = getattr(transformers, 'TFAutoModelForMaskedLM', None)
+                if tf_model_cls is None:
+                    raise ImportError('TFAutoModelForMaskedLM is not available. Install tensorflow-enabled transformers.')
+                self.model = tf_model_cls.from_pretrained(model_path)
+                self.caller = tensorflow.function(self.model.call, experimental_relax_shapes=True)
+            else:
+                pt_model_cls = getattr(transformers, 'AutoModelForMaskedLM', None)
+                if pt_model_cls is None:
+                    raise ImportError('AutoModelForMaskedLM is not available. Install torch-enabled transformers.')
+                self.model = pt_model_cls.from_pretrained(model_path)
+                self.model.eval()
+                if torch.cuda.is_available():
+                    self.device = torch.device('cuda')
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    self.device = torch.device('mps')
+                else:
+                    self.device = torch.device('cpu')
+                self.model.to(self.device)
+                self.caller = self.model
 
             # set tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -73,10 +98,27 @@ class LanguageModel(abc.ABC):
         path
             Path to the checkpoint.
         """
-        # set model (for performance reasons the `call` method is wrapped in tf.function)
-        self.model = TFAutoModelForMaskedLM.from_pretrained(path, local_files_only=True)
-
-        self.caller = tf.function(self.model.call, experimental_relax_shapes=True)
+        if self.backend == 'tensorflow':
+            # set model (for performance reasons the `call` method is wrapped in tf.function)
+            tf_model_cls = getattr(transformers, 'TFAutoModelForMaskedLM', None)
+            if tf_model_cls is None:
+                raise ImportError('TFAutoModelForMaskedLM is not available. Install tensorflow-enabled transformers.')
+            self.model = tf_model_cls.from_pretrained(path, local_files_only=True)
+            self.caller = tensorflow.function(self.model.call, experimental_relax_shapes=True)
+        else:
+            pt_model_cls = getattr(transformers, 'AutoModelForMaskedLM', None)
+            if pt_model_cls is None:
+                raise ImportError('AutoModelForMaskedLM is not available. Install torch-enabled transformers.')
+            self.model = pt_model_cls.from_pretrained(path, local_files_only=True)
+            self.model.eval()
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+            else:
+                self.device = torch.device('cpu')
+            self.model.to(self.device)
+            self.caller = self.model
 
         # set tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
@@ -330,14 +372,20 @@ class LanguageModel(abc.ABC):
             if 'attention_mask' in x.keys():
                 x_batch['attention_mask'] = x['attention_mask'][istart:istop]
 
-            y[istart:istop] = self.caller(**x_batch).logits.numpy()
+            if self.backend == 'tensorflow':
+                y[istart:istop] = self.caller(**x_batch).logits.numpy()
+            else:
+                with torch.inference_mode():
+                    pt_batch = {k: torch.as_tensor(v, device=self.device) for k, v in x_batch.items()}
+                    logits = self.caller(**pt_batch).logits
+                    y[istart:istop] = logits.detach().cpu().numpy()
         return y
 
 
 class DistilbertBaseUncased(LanguageModel):
     SUBWORD_PREFIX = '##'
 
-    def __init__(self, preloading: bool = True):
+    def __init__(self, preloading: bool = True, backend: str = 'tensorflow'):
         """
         Initialize `DistilbertBaseUncased`.
 
@@ -346,7 +394,7 @@ class DistilbertBaseUncased(LanguageModel):
         preloading
             See :py:meth:`alibi.utils.lang_model.LanguageModel.__init__`.
         """
-        super().__init__("distilbert-base-uncased", preloading)
+        super().__init__("distilbert-base-uncased", preloading, backend=backend)
 
     @property
     def mask(self) -> str:
@@ -359,7 +407,7 @@ class DistilbertBaseUncased(LanguageModel):
 class BertBaseUncased(LanguageModel):
     SUBWORD_PREFIX = '##'
 
-    def __init__(self, preloading: bool = True):
+    def __init__(self, preloading: bool = True, backend: str = 'tensorflow'):
         """
         Initialize `BertBaseUncased`.
 
@@ -368,7 +416,7 @@ class BertBaseUncased(LanguageModel):
         preloading
             See :py:meth:`alibi.utils.lang_model.LanguageModel.__init__`.
         """
-        super().__init__("bert-base-uncased", preloading)
+        super().__init__("bert-base-uncased", preloading, backend=backend)
 
     @property
     def mask(self) -> str:
@@ -381,7 +429,7 @@ class BertBaseUncased(LanguageModel):
 class RobertaBase(LanguageModel):
     SUBWORD_PREFIX = 'Ġ'
 
-    def __init__(self, preloading: bool = True):
+    def __init__(self, preloading: bool = True, backend: str = 'tensorflow'):
         """
         Initialize `RobertaBase`.
 
@@ -390,7 +438,7 @@ class RobertaBase(LanguageModel):
         preloading
             See :py:meth:`alibi.utils.lang_model.LanguageModel.__init__` constructor.
         """
-        super().__init__("roberta-base", preloading)
+        super().__init__("roberta-base", preloading, backend=backend)
 
     @property
     def mask(self) -> str:

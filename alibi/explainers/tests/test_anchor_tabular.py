@@ -351,3 +351,42 @@ def test_anchor_tabular_explain_fails_not_fitted():
         explainer.explain(np.ones(2))
     expected_msg = "This AnchorTabular instance is not fitted yet. Call 'fit' with appropriate arguments first."
     assert str(err.value) == expected_msg
+
+
+def test_instrumentation_and_budget_flags(at_iris_explainer, at_defaults):
+    X_test, explainer, _, _ = at_iris_explainer
+    threshold = at_defaults['desired_confidence']
+    explanation = explainer.explain(
+        X_test[0],
+        threshold=threshold,
+        **at_defaults,
+        max_total_samples=64,
+        memory_saver_mode=True,
+        adaptive_budget=True,
+        max_perturbation_batch_size=16,
+    )
+    metrics = explanation.raw['instrumentation']
+    assert metrics['time_per_explanation_s'] > 0
+    assert metrics['peak_rss_mb'] > 0
+    assert metrics['model_calls'] > 0
+    assert metrics['perturbation_samples_evaluated'] > 0
+    assert metrics['max_total_samples_hit'] is True
+
+
+def test_deterministic_seed_reproducibility(iris_data, rf_classifier):
+    data = iris_data
+    clf, _ = rf_classifier
+    pred_fn = predict_fcn('class', clf)
+
+    explainer_a = AnchorTabular(pred_fn, data['metadata']['feature_names'], seed=7)
+    explainer_b = AnchorTabular(pred_fn, data['metadata']['feature_names'], seed=7)
+    explainer_a.fit(data['X_train'], disc_perc=(25, 50, 75))
+    explainer_b.fit(data['X_train'], disc_perc=(25, 50, 75))
+
+    x = data['X_test'][0]
+    exp_a = explainer_a.explain(x, threshold=0.9, batch_size=100, coverage_samples=500)
+    exp_b = explainer_b.explain(x, threshold=0.9, batch_size=100, coverage_samples=500)
+
+    assert exp_a.anchor == exp_b.anchor
+    assert np.isclose(exp_a.precision, exp_b.precision)
+    assert np.isclose(exp_a.coverage, exp_b.coverage)
