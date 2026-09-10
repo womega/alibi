@@ -1,9 +1,9 @@
 name: OpenSeat mobile lock generator
 
 on:
-  push:
+  pull_request:
     branches:
-      - tmp/openseat-mobile-lock-20260910
+      - master
 
 permissions:
   contents: read
